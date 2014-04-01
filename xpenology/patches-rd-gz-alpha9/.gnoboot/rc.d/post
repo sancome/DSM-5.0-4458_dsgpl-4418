@@ -1,0 +1,76 @@
+#!/bin/sh
+
+gnoBootInstallModules()
+{
+	for x in ${HD_MODULES}; do
+		[ -f /lib/modules/$x.ko ] && \
+		gnoUpdateFile /lib/modules/$x.ko ${gnoRoot}/lib/modules/$x.ko
+	done
+
+	modDir="${gnoBoot}/modules.d"
+	[ -d "${gnoRoot}${modDir}" ] || mkdir "${gnoRoot}${modDir}"
+	for modfile in $(ls -1 ${gnoBoot}/modules.d); do
+		gnoUpdateFile "${modDir}/${modfile}" \
+				"${gnoRoot}${modDir}/${modfile}"
+	done
+}
+
+gnoBootUpdateFiles()
+{
+	
+	if [ -d ${gnoBoot} ]; then
+		gnoMountRoot
+		[ -d "${gnoRoot}${gnoBoot}" ] || mkdir "${gnoRoot}${gnoBoot}"
+                gnoUpdateFile "${gnoBoot}/devices-append" \
+			"${gnoRoot}${gnoBoot}/devices-append"
+		gnoUpdateFile "${gnoBoot}/rc.d/xpenology" \
+			"${gnoRoot}/usr/syno/cfgen/s03_xpenology"
+		gnoUpdateFile "${gnoBoot}/modules.conf" \
+			"${gnoRoot}${gnoBoot}/modules.conf"
+		gnoUpdateFile "${gnoBoot}/rc.d/init" \
+			"${gnoRoot}${gnoBoot}/rc.init"
+		gnoUpdateFile /etc/rc.network "${gnoRoot}/etc/rc.network"
+		gnoUpdateFile /etc/rc.network "${gnoRoot}/etc.defaults/rc.network"
+		gnoUpdateFile /etc/rc.subr "${gnoRoot}/etc/rc.subr"
+		gnoUpdateFile /etc/rc.subr "${gnoRoot}/etc.defaults/rc.subr"
+
+		if [ $(gnoBootIsCmdParam debug) -eq 1 ]; then
+			echo "----- dmesg -----" >> /tmp/gnoboot.debug
+			dmesg >> /tmp/gnoboot.debug
+			gnoUpdateFile /tmp/gnoboot.debug \
+				"${gnoRoot}${gnoBoot}/debug.log"
+		fi
+	fi
+}
+
+gnoBootSynobios()
+{
+	if [ -f /lib/modules/synobios.ko ]; then
+		gnoUpdateFile /lib/modules/synobios.ko \
+			"${gnoRoot}/lib/modules/synobios.ko"
+	else
+		Exit 22 "BUG: Missing important file, get the latest gnoBoot!!!" 
+	fi
+}
+
+gnoBootUpgrade()
+{
+[ $(gnoBootIsCmdParam gnoboot_upgrade) -eq 0 ] && return
+
+VersionFlash=`/bin/get_key_value /etc.defaults/VERSION buildnumber`
+VersionHD=`/bin/get_key_value ${Mnt}/etc.defaults/VERSION buildnumber`
+
+if [ "$VersionFlash" != "$VersionHD" ]; then
+	Exit 7 "Version number not match"
+fi
+}
+
+gnoBootInitPost()
+{
+	gnoBootUpgrade
+	gnoBootUpdateFiles 
+	gnoBootInstallModules
+	gnoBootSynobios
+}
+
+gnoBootInitPost

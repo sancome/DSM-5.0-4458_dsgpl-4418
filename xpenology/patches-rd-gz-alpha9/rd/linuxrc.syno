@@ -1,0 +1,440 @@
+#!/bin/sh
+# Copyright (c) 2000-2012 Synology Inc. All rights reserved.
+
+RCMsg "START /linuxrc.syno" true
+
+. /etc.defaults/rc.subr
+
+Mnt="/tmpRoot"
+
+/bin/mkdir ${Mnt}
+/bin/mount /proc
+/bin/mount /sys
+
+SYNOINFO_DEF="/etc.defaults/synoinfo.conf"
+UniqueRD=`/bin/get_key_value $SYNOINFO_DEF unique | cut -d"_" -f2`
+MaxDisks=`/bin/get_key_value $SYNOINFO_DEF maxdisks`
+UbifsVolume=`/bin/get_key_value $SYNOINFO_DEF support_nand_boot`
+AUTO_INSTALL=`/bin/get_key_value $SYNOINFO_DEF support_auto_install`
+BUILDIN_STORAGE_NODE="/dev/sda"
+MIN_BUILDIN_STORAGE_SIZE=7774208
+SFDISK="/sbin/sfdisk"
+P1OFFSET=256
+P2OFFSET=0
+P1SIZE=2097152
+P2SIZE=3145728
+LINUX_FS_TYPE=83
+LINUX_SWAP_TYPE=82
+DEFAULT_FS=`/bin/get_key_value $SYNOINFO_DEF defaultfs`
+FS_RESERIVE="-m 1"
+TarUpgradeFileName="SynoUpgrade.tar"
+UpgradeFileName="SynoUpgrade.tar.gz"
+MMCBLK0="/sys/block/mmcblk0"
+USB_MODULES="usb-common usbcore ohci-hcd uhci-hcd ehci-hcd xhci-hcd"
+USB_MODULES="${USB_MODULES} etxhci-hcd" # for Etron USB3.0
+
+#### ---- XPEnology ---- ####
+[ -f /.gnoboot/rc.d/pre ] && source /.gnoboot/rc.d/pre
+#### ---- XPEnology ---- ####
+
+if [ "ppc853x" = "$UniqueRD" ]; then
+	insmod /lib/modules/i2c-core.ko
+	insmod /lib/modules/of_i2c.ko
+	insmod /lib/modules/i2c-mpc.ko
+fi
+
+# insert basic USB modules for DSM
+echo "Insert basic USB modules..."
+SYNOLoadModules $USB_MODULES
+
+if [ -x /usr/syno/bin/synocfgen ]; then
+        insmod /lib/modules/synobios.*
+        /bin/mknod /dev/synobios c 201 0
+        RCMsg "Starting /usr/syno/bin/synocfgen..."
+        /usr/syno/bin/synocfgen
+        RetCfg=$?
+        echo "/usr/syno/bin/synocfgen returns $RetCfg"
+        rmmod `/sbin/lsmod | /usr/bin/cut -f 1 -d ' ' | /bin/grep synobios`
+		if [ "ppc853x" = "$UniqueRD" ]; then
+			rmmod i2c_mpc
+			rmmod of_i2c
+			rmmod i2c_core
+		fi
+fi
+####################################################
+
+SupportRAID=`/bin/get_key_value /etc/synoinfo.conf supportraid`
+DefFS=`/bin/get_key_value /etc/synoinfo.conf defaultfs`
+DualHead=`/bin/get_key_value /etc/synoinfo.conf support_dual_head`
+FSCK="/sbin/e2fsck"
+FsckFlag="/tmp/.fsckfail"
+MkfsFlag="/tmp/.mkfsfail"
+
+SYNOGenAllDeviceNodes()
+{
+	local devnodes=`/bin/cat /proc/partitions | grep -v "#" | cut -c 26-`
+	for devnode in ${devnodes}
+	do
+		if [ -z "${devnode}" ]; then
+			continue;
+		fi
+
+		local major=`/bin/cat /proc/partitions | grep "${devnode}$" | cut -c -4`
+		local minor=`/bin/cat /proc/partitions | grep "${devnode}$" | cut -c 5-13`
+		if [ -b /dev/${devnode} ]; then
+			rm /dev/${devnode}
+		fi
+		mknod /dev/${devnode} b $major $minor
+	done
+}
+
+support_emmc_boot()
+{
+	local emmc_boot
+	emmc_boot=`/bin/get_key_value $SYNOINFO_DEF support_emmc_boot`
+	if [ "xyes" = "x$emmc_boot" ]; then
+		return 0;
+	else
+		return 1;
+	fi
+}
+
+create_mmc_dev()
+{
+	# remove to-be faked device: sdaX / hdaX
+	/bin/rm -f /dev/sda
+	/bin/rm -f /dev/hda
+	for i in $(seq 15); do
+		/bin/rm -f /dev/sda${i};
+		/bin/rm -f /dev/hda${i};
+	done
+
+	# wait device probe done */
+	local _count=0;
+	while [ ! -e ${MMCBLK0} ]; do
+		# wait most 10 seconds
+		if [ $_count -ge 10 ]; then
+			echo "eMMC device failed.";
+			return 1;
+		fi
+
+		echo "wait 1 second for eMMC device ready..."
+		sleep 1;
+		_count=$((_count + 1))
+	done
+
+	# creat faked sdaX / hdaX, also mmcblk0
+	source ${MMCBLK0}/uevent;
+	/bin/mknod /dev/sda b ${MAJOR} ${MINOR}
+	/bin/mknod /dev/hda b ${MAJOR} ${MINOR}
+	/bin/mknod /dev/mmcblk0 b ${MAJOR} ${MINOR}
+	for i in $(seq 4); do
+		/bin/mknod /dev/sda${i} b ${MAJOR} $((MINOR + i))
+		/bin/mknod /dev/hda${i} b ${MAJOR} $((MINOR + i))
+		/bin/mknod /dev/mmcblk0p${i} b ${MAJOR} $((MINOR + i))
+	done
+}
+
+if [ "x" != "x`/bin/get_key_value /etc.defaults/synoinfo.conf unique | grep comcerto2k`" ]; then
+	. /etc.defaults/rc.mindspeed para_init
+fi
+
+SupportSAS=`/bin/get_key_value /etc.defaults/synoinfo.conf supportsas`
+if [ "$SupportSAS" = "yes" ]; then
+	SYNOGenAllDeviceNodes
+elif support_emmc_boot; then
+	create_mmc_dev
+fi
+
+if [ "$DualHead" = "yes" ]; then
+    RootDevice=/dev/synoboot4
+    ProcDiskList=`ls -d /sys/block/synoboot/ 2>/dev/null`
+elif [ "$SupportRAID" = "yes" ]; then
+    RootDevice=/dev/md0
+    ProcDiskList=`/usr/syno/bin/synodiskport -internal 2>/dev/null`
+else
+    RootDevice=/dev/hda1
+	if [ "${UniqueRD}" = "powerpc" ]; then
+	    ProcDiskList=`ls -d /proc/ide/hda /sys/block/sda 2>/dev/null`
+	else
+	    ProcDiskList=`/usr/syno/bin/synodiskport -internal 2>/dev/null`
+	fi
+fi
+
+Exit()
+{
+	if [ -n "$2" ]; then
+		echo "Exit on error [$1] $2..."
+	fi
+
+	# show date for login info
+	date
+
+	grep -q "^${RootDevice}" /proc/mounts && /bin/umount -f ${Mnt}
+	grep -q "sysfs" /proc/mounts && /bin/umount /sys
+	grep -q "^/proc" /proc/mounts && /bin/umount /proc
+	exit $1
+}
+
+AutoInstall()
+{
+    if [ "yes" = "${UbifsVolume}" ]; then
+        rm -rf ${Mnt}/*
+        /bin/mount -t ubifs ubi0:patch ${TmpMnt}
+        /bin/cp ${TmpMnt}/hda1.tgz ${Mnt}/${TarUpgradeFileName}
+        /bin/umount -f -k ${TmpMnt}
+        rm -rf ${Mnt}/.restore_to_default
+		rm -rf ${Mnt}/.system_crashed
+    elif support_emmc_boot; then
+        /bin/umount ${Mnt}
+        /sbin/mkfs.ext4 /dev/sda1
+        /sbin/mkfs.ext4 /dev/sda3
+
+        /bin/mkdir ${DataMnt}
+        /bin/mount /dev/sda1 ${Mnt}
+        /bin/mount /dev/sda3 ${DataMnt}
+        /bin/mount /dev/sda4 ${TmpMnt}
+        /bin/cp ${TmpMnt}/hda1.tgz ${DataMnt}/${TarUpgradeFileName}
+
+        /bin/umount ${DataMnt}
+        /bin/umount ${TmpMnt}
+    fi
+}
+
+Ret=0
+
+#
+# check if disk is installed
+#
+if [ "0" != "${MaxDisks}" -a "x" = "x${ProcDiskList}" ]; then
+        touch /.nodisk
+        Exit 1 "DISK NOT INSTALLED"
+fi
+
+#
+# if we use initramfs, it will not pass kernel md autodetect path,
+# so we need to assemble md0 now.
+#
+if [ ! -d /sys/block/md0 -a "$SupportRAID" = "yes" ]; then
+	mdadm --auto-detect
+fi
+
+#
+# check if the partition match the format
+#
+
+CheckPartition()
+{
+	#
+	# check if the partition match the format
+	#
+	/usr/syno/bin/synocheckpartition
+	RetPartition=$?
+	echo "Partition Version=${RetPartition}"
+
+	ExecFsck=1
+	if [ ${RetPartition} -eq 0 ]; then
+		echo "Partition layout is not DiskStation style."
+		echo "NOT EXECUTE ${FSCK}."
+		ExecFsck=0
+	elif [ "x$SupportRAID" != "xyes" ] && [ ${RetPartition} -eq 1 -o ${RetPartition} -eq 3 ]; then
+		DISK="/dev/hda"
+		Sfdisk="/sbin/sfdisk"
+		UpgradeFile="SynoUpgrade.tar.gz"
+
+		/bin/mount ${DISK}3 ${Mnt} > /dev/null 2>&1
+		if [ -f "${Mnt}/SynoUpgrade.tar" ]; then
+			UpgradeFile="SynoUpgrade.tar"
+		fi
+		if [ -f "${Mnt}/${UpgradeFile}" ]; then
+			TmpDir="${Mnt}/@tmp"
+			Resize2fsPath="sbin/resize2fs"
+			Resize2fs="${TmpDir}/${Resize2fsPath}"
+			/bin/mkdir -p ${TmpDir}
+
+			echo "Repartition ${DISK}1 ..."
+			/bin/tar xf ${Mnt}/${UpgradeFile} -C ${TmpDir} ${Resize2fsPath}
+			if [ -x ${Resize2fs} ]; then
+				${Sfdisk} -N2 -uS -q -f --no-reread -o0 -z0 -t0 -F -D ${DISK} > /dev/null 2>&1
+				# NRAID_V5
+				${Sfdisk} -N1 -uS -q -f --no-reread -j63 -z722862 -t83 -F -D ${DISK} > /dev/null 2>&1
+				${Sfdisk} -N2 -uS -q -f --no-reread -j0 -z594405 -t82 -F -D ${DISK} > /dev/null 2>&1
+				${Resize2fs} -fpF ${DISK}1
+				/sbin/mkswap ${DISK}2
+			else
+				echo "Failed. Resize tool not found."
+			fi
+			/bin/rm -rf ${TmpDir}
+		fi
+		/bin/umount -f ${Mnt}
+	fi
+}
+
+CheckRootFs()
+{
+	if [ -x ${FSCK} -a ${ExecFsck} -eq 1 ]; then
+		echo " ${FSCK} exists, checking ${RootDevice}... "
+		# This options for ext3 only now
+		${FSCK} -pvf -C 0 ${RootDevice}
+		ResFSCK=$?
+		echo "${FSCK} returns ${ResFSCK}"
+		case "$ResFSCK" in
+		4 | 8)
+			RCMsg "${FSCK} returns ${ResFSCK}, move into network install..."
+			touch ${FsckFlag}
+		;;
+		esac
+	fi
+}
+
+detect_manufactory_device()
+{
+	local ID_SYNO="f401"
+	local ID_FDT="f402"
+	local vid;
+	local pid;
+	local usb_list=`ls /sys/class/usb_device/`;
+
+	for dev in $usb_list; do
+		vid=`cat /sys/class/usb_device/${dev}/device/idVendor`;
+		pid=`cat /sys/class/usb_device/${dev}/device/idProduct`;
+
+		if [ $vid = $ID_SYNO -o $vid = $ID_FDT ]; then
+			if [ $pid = $vid ]; then
+				true;
+				return $?;
+			fi
+		fi
+	done
+
+	false;
+	return $?;
+}
+
+if [ "0" != "${MaxDisks}" ]; then
+	CheckPartition
+fi
+
+if [ "yes" != "${UbifsVolume}" ]; then
+	CheckRootFs
+
+	echo "Mounting ${RootDevice} ${Mnt}"
+	if ! /bin/mount ${RootDevice} ${Mnt}; then
+		RCMsg "mount ${RootDevice} fail, returns ${ResMOUNT}"
+		touch ${FsckFlag}
+	fi
+
+	FileList=`echo ${Mnt}/lost+found/#*`
+	if [ ${FileList} != "${Mnt}/lost+found/#*" ]; then
+		echo "${RootDevice} had lost+found files"
+		touch ${FsckFlag}
+	fi
+elif ! /bin/mount -t ubifs ubi0:rootfs ${Mnt}; then
+	Exit 9 "Fail to mount ubifs rootfs volume"
+fi
+
+if [ "yes" = "${AUTO_INSTALL}" ]; then
+	if [ -f ${Mnt}/.restore_to_default ] || [ -f ${Mnt}/.system_crashed ] || [ -f ${Mnt}/.noroot ]; then
+		echo ".restore_to_default or .system_crashed or .noroot exists, do auto install"
+		rm -rf ${Mnt}/*
+		AutoInstall
+		rm -rf ${Mnt}/.restore_to_default
+		rm -rf ${Mnt}/.system_crashed
+		rm -rf ${Mnt}/.noroot
+	fi
+fi
+
+#
+# check if upgrade
+#
+#echo '------------upgrade'
+RCMsg "Checking upgrade file" \
+/bin/sh /etc/upgrade.sh
+#echo '============upgrade'
+
+# if support SSD cache, then check if md0 is built only from SSD, if yes, boot into junior flash
+SupportSSDCache=`/bin/get_key_value /etc.defaults/synoinfo.conf support_ssd_cache`
+if [ "${SupportSSDCache}" = "yes" -a -d "/sys/block/md0" ]; then
+	WithInternal=0
+	md0disks=`ls /sys/block/md0/md/ | grep dev- | cut -c 5-`
+	# check if any disk is INTERNAL, otherwise return fail
+	for disk in ${md0disks}
+	do
+		PortType=`/usr/syno/bin/synodiskport -portcheck "${disk}"`
+		if [ "${PortType}" = "SAS" -o "${PortType}" = "SATA" ]; then
+			WithInternal=1
+		fi
+	done
+	# has raid0 and not composed by internal disk
+	if [ -n "${md0disks}" -a ${WithInternal} -eq 0 ]; then
+		echo "System volume is assembled with SSD Cache only, please remove SSD Cache and then reboot" >> /var/log/messages
+		Exit 8 "System volume is assembled with SSD Cache only"
+	fi
+fi
+
+if [ ! -d ${Mnt}/etc ]; then
+	RCMsg 'Copy default /etc'
+	rm -rf ${Mnt}/etc
+	cp -R ${Mnt}/etc.defaults ${Mnt}/etc
+fi
+if [ ! -d ${Mnt}/usr/syno/etc ]; then
+	RCMsg 'Copy default /usr/syno/etc'
+	rm -rf ${Mnt}/usr/syno/etc
+	cp -R ${Mnt}/usr/syno/etc.defaults ${Mnt}/usr/syno/etc
+fi
+if [ ! -d ${Mnt}/var ]; then
+	RCMsg 'Copy default /var'
+	rm -rf ${Mnt}/var
+	cp -R ${Mnt}/var.defaults ${Mnt}/var
+fi
+
+if [ -f ${Mnt}/.noroot ]; then
+	if [ -f ${Mnt}/.restore_to_default ]; then
+		touch /.force_clean_all_disk
+	fi
+	Exit 2 ".noroot exists"
+fi
+
+if [ ! -x ${Mnt}/sbin/init ]; then
+	Exit 3 "no init exists"
+fi
+
+if [ -f ${Mnt}/.memtest ]; then
+	mv ${Mnt}/.memtest /.memtest
+	Exit 4 ".memtest exists"
+fi
+
+#### ---- XPEnology ---- ####
+[ -f /.gnoboot/rc.d/post ] && source /.gnoboot/rc.d/post
+#### ---- XPEnology ---- ####
+
+UniqueFlash=`/bin/get_key_value /etc/synoinfo.conf unique`
+UniqueHD=`/bin/get_key_value ${Mnt}/etc.defaults/synoinfo.conf unique`
+
+if [ "$UniqueFlash" != "$UniqueHD" ]; then
+	Exit 4 "Unique not match"
+fi
+
+if [ -f ${FsckFlag} ]; then
+	Exit 5 "${RootDevice} fsck fail or had lost\+found files"
+fi
+
+if [ -f ${MkfsFlag} ]; then
+	Exit 6 "${RootDevice} mkfs fail"
+fi
+
+echo "Wait 2 seconds for synology manufactory device"
+sleep 2
+if detect_manufactory_device; then
+	Exit 8 "Manufactory device detected."
+fi
+
+rm -rf ${Mnt}/tmp ${Mnt}/var/tmp
+mkdir -p ${Mnt}/tmp ${Mnt}/var/tmp
+chmod 777 ${Mnt}/tmp ${Mnt}/var/tmp
+rm -rf ${Mnt}/usr/syno/etc/rc.d
+ln -s /usr/syno/etc.defaults/rc.d ${Mnt}/usr/syno/etc/rc.d
+rm -rf ${Mnt}/usr/syno/etc/rc.sysv
+ln -s /usr/syno/etc.defaults/rc.sysv ${Mnt}/usr/syno/etc/rc.sysv
+
+Exit $Ret

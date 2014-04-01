@@ -1,0 +1,1349 @@
+#!/bin/sh -
+# Copyright (c) 2000-2012 Synology Inc. All rights reserved.
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/syno/sbin:/usr/syno/bin
+
+. /etc.defaults/rc.subr
+
+KERNEL_VCODE=`KernelVersionCode $(KernelVersion)`
+WIFI_MODEL=`/bin/get_key_value /etc.defaults/synoinfo.conf boot_wireless_mode`
+
+DHCPD_INFO="/etc/dhcpd/dhcpd.info"
+DHCPD_CONF="/etc/dhcpd/dhcpd.conf"
+DHCPD_LEASES="/etc/dhcpd/dhcpd.conf.leases"
+DHCPD_LEASES_LOG="/etc/dhcpd/dhcpd-leases.log"
+
+if [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6.32") ]; then
+	BRIDGE_MODULES="llc stp bridge"
+	VLAN_MODULES="8021q"
+else
+	BRIDGE_MODULES=
+	TC_MODULES=
+	VLAN_MODULES=
+fi
+
+# @ret
+#     3: router mode (maybe bridge mode included)
+#     2: bridge mode
+#     1: normal mode
+check_topology_mode ()
+{
+	local bridge_exist=1
+	for ifn in `ls /sys/class/net`; do
+		if [ ! -d "/sys/class/net/${ifn}/bridge" ]; then
+			continue
+		fi
+		bridge_exist=2
+		local IFCFG_FILE="/etc/sysconfig/network-scripts/ifcfg-${ifn}"
+		local LOCAL_LAN=`/bin/get_key_value ${IFCFG_FILE} LOCAL_LAN`
+		if [ "$LOCAL_LAN" = "yes" ]; then
+			return 3
+		fi
+	done
+	return $bridge_exist
+}
+
+set_kernel_topology_mode()
+{
+	local SupportTopology=`get_key_value /etc.defaults/synoinfo.conf support_net_topology`
+	local NetTopology=`get_key_value /etc/synoinfo.conf net_topology`
+	local topology="0"
+
+	if [ "yes" != "${SupportTopology}" ]; then
+		return 0;
+	fi
+
+	case "$NetTopology" in
+		sta)
+			topology="1"
+			;;
+		ap)
+			topology="2"
+			;;
+		router)
+			topology="3"
+			;;
+		*)
+			;;
+	esac
+	echo "${topology}" > /proc/sys/kernel/syno_topology_mode
+}
+
+merge_dhcpd_conf ()
+{
+	local LEASE_FILE_NAME="dhcpd.conf.leases"
+	local LEASE_FILE="dhcp-leasefile=/etc/dhcpd/${LEASE_FILE_NAME}"
+	local CONF_FILE=`ls /etc/dhcpd/dhcpd-*.conf 2> /dev/null`
+
+	if [ "${CONF_FILE}" = "" ]; then
+		return 1
+	fi
+
+	cat ${CONF_FILE} > ${DHCPD_CONF}
+	echo ${LEASE_FILE} >> ${DHCPD_CONF}
+
+	return 0
+}
+
+merge_dhcpd_info ()
+{
+	local CONF_FILE=`ls /etc/dhcpd/dhcpd-*.conf 2> /dev/null`
+	if [ "${CONF_FILE}" = "" ]; then
+		echo "enable=\"no\"" > ${DHCPD_INFO}
+		return 1
+	fi
+
+	echo "enable=\"yes\"" > ${DHCPD_INFO}
+
+	return 0
+}
+
+nat_stop_dhcpd ()
+{
+	local DHCPD_SERVER_PID=`ps | grep dnsmasq | grep conf-file | awk '{print $1}'`
+	if [ -n "${DHCPD_SERVER_PID}" ]; then
+		kill -9 ${DHCPD_SERVER_PID}
+	fi
+
+	echo "enable=\"no\"" > ${DHCPD_INFO}
+
+	# If DHCP PACKAGE is installed, when DHCP Server enable there has
+	# soft link to /var/packages/DHCPServer/target/etc, when DHCP Starting
+	# the soft link will be generated, and the link should be remove when
+	# DHCP Stop.
+	if [ -e ${DHCP_PKG_ENABLE} ]; then
+		rm -f ${DHCPD_LEASES}
+		rm -f ${DHCPD_LEASES_LOG}
+	fi
+	return 0
+}
+
+nat_start_dhcpd ()
+{
+	if [ "$WIFI_MODEL" != "" ]; then
+		cp /etc/dhcpd/dhcpd-lbr0-lbr0.conf.junior /etc/dhcpd/dhcpd-lbr0-lbr0.conf 2>/dev/null
+	fi
+	merge_dhcpd_conf
+	merge_dhcpd_info
+	local DHCP_MAX_LEASE="2147483648"
+	if [ ! -f ${DHCPD_INFO} ]; then
+		return 1
+	fi
+
+	if [ ! -f ${DHCPD_CONF} ]; then
+		return 1
+	fi
+
+	local DHCPD_ENABLE=`/bin/get_key_value ${DHCPD_INFO} enable`
+	if [ "${DHCPD_ENABLE}" = "yes" ]; then
+		DHCPD_SERVER_PID=`ps | grep dnsmasq | awk '{print $1}'`
+		if [ -n "${DHCPD_SERVER_PID}" ]; then
+			kill -9 ${DHCPD_SERVER_PID}
+		fi
+		killall dnsmasq 2>/dev/null
+		sleep 1 # make sure dnsmasq be killed
+		dnsmasq --user=root --cache-size=200 --conf-file=${DHCPD_CONF} --dhcp-lease-max=${DHCP_MAX_LEASE} &
+		return 2
+	fi
+
+	return 0
+}
+
+nat_add_interface () # $1=dhcp server interface. The others are outer interfaces
+{
+	local nat_internal_if=$1
+	shift;
+
+	local nat_network_interfaces=""
+	if [ $# -le 0 ]; then
+		# enum all output interface
+		for ext_ifn in `ls /sys/class/net/`; do
+			if [ "${ext_ifn}" = "lo" -o "${ext_ifn}" = "${nat_internal_if}" ]; then
+				continue;
+			fi
+			nat_network_interfaces="${nat_network_interfaces} ${ext_ifn}"
+		done
+	else
+		nat_network_interfaces="$@"
+	fi
+
+	for thisif in $nat_network_interfaces; do
+		DHCPD_INFO="/etc/dhcpd/dhcpd.info"
+		IFCFG_FILE="/etc/sysconfig/network-scripts/ifcfg-${nat_internal_if}"
+
+		if [ -f ${DHCPD_INFO} -a -f ${IFCFG_FILE} ]; then
+			local CIDR=`/bin/get_key_value ${IFCFG_FILE} CIDR`
+
+			if [ ! -d /sys/class/net/${thisif} ]; then
+				continue
+			fi
+
+			iptables -t nat -A POSTROUTING -s ${CIDR} -o ${thisif} -j MASQUERADE
+		fi
+	done
+}
+
+activate_dnat ()
+{
+	local RPFDIR="/etc/portforward/routerpf"
+	local PF_RULE="${RPFDIR}/rule.conf"
+	local PF_DUMP_SAVE="/tmp/rpfwd_rules.dump"
+	local PF_DNAT_DUMP="${RPFDIR}/dnat_rules.dump"
+	local PF_FILTER_DUMP="${RPFDIR}/filter_rules.dump"
+
+	disable_dnat
+	synorouterportfwd
+
+	if [ -f "$PF_DNAT_DUMP" -a -f "$PF_FILTER_DUMP" ]; then
+		cat "$PF_DNAT_DUMP" | sed s/"-A"/"-D"/g > "$PF_DUMP_SAVE"
+		cat "$PF_FILTER_DUMP" | sed s/"-A"/"-D"/g >> "$PF_DUMP_SAVE"
+		/usr/syno/etc/rc.d/S01iptables.sh start
+
+		while read line; do
+			eval `iptables $line &> /dev/null`
+		done < "$PF_DNAT_DUMP"
+		rm "$PF_DNAT_DUMP" &> /dev/null
+		rm "$PF_FILTER_DUMP" &> /dev/null
+	else
+		/usr/syno/etc/rc.d/S01iptables.sh force-reload
+	fi
+
+}
+
+disable_dnat()
+{
+	local PF_DUMP_SAVE="/tmp/rpfwd_rules.dump"
+	if [ -f "$PF_DUMP_SAVE" ]; then
+		while read line; do
+		 eval `iptables $line &> /dev/null`
+		done < "$PF_DUMP_SAVE"
+		rm "$PF_DUMP_SAVE" &> /dev/null
+	fi
+
+}
+
+activate_nat_rule ()
+{
+	merge_dhcpd_conf
+
+	for ifn in ${network_interfaces}; do
+		local IFCFG_FILE="/etc/sysconfig/network-scripts/ifcfg-${ifn}"
+		local LOCAL_LAN=`/bin/get_key_value ${IFCFG_FILE} LOCAL_LAN`
+		local BOOTPROTO=`get_key_value ${IFCFG_FILE} BOOTPROTO`
+		if [ ! -d "/sys/class/net/${ifn}/bridge" -o "${BOOTPROTO}" != "static" -o "$LOCAL_LAN" != "yes" ]; then
+			continue;
+		fi
+		local IPADDR=`get_key_value ${IFCFG_FILE} IPADDR`
+		local NETMASK=`get_key_value ${IFCFG_FILE} NETMASK`
+		local IS_ROUTER=`grep option:router ${DHCPD_CONF} | grep -c ${IPADDR}`
+		if [ ${IS_ROUTER} -eq 0 ]; then
+			continue
+		fi
+		CIDR_PREFIX=`ipcalc -p ${IPADDR} ${NETMASK} | cut -d'=' -f2`
+		CIDR_IP=`ipcalc -n ${IPADDR} ${NETMASK} | cut -d'=' -f2`
+		CIDR="${CIDR_IP}/${CIDR_PREFIX}"
+
+		iptables -t nat -D POSTROUTING -s ${CIDR} -j MASQUERADE
+		iptables -t nat -A POSTROUTING -s ${CIDR} -j MASQUERADE
+	done
+}
+
+activate_nat ()
+{
+	local S01Scripts="/usr/syno/etc/rc.d/S01iptables.sh"
+	check_topology_mode
+	local topology=$?
+	local ret=""
+
+	if [ "$WIFI_MODEL" = "" ]; then
+		return
+	fi
+
+	if [ -x ${S01Scripts} ]; then
+		${S01Scripts} load_nat_mod
+	else
+		return 1
+	fi
+
+	activate_dnat
+	nat_start_dhcpd
+	ret=$?
+
+	echo "1" > /proc/sys/net/ipv4/ip_forward
+	if [ ! ${ret} -eq 2 ]; then
+		killall dnsmasq 2>/dev/null
+		sleep 1 # make sure dnsmasq be killed
+		dnsmasq --user=root --cache-size=200 &
+	fi
+	return 0
+}
+
+disable_nat_rule ()
+{
+	for ifn in ${network_interfaces}; do
+		local IFCFG_FILE="/etc/sysconfig/network-scripts/ifcfg-${ifn}"
+		local LOCAL_LAN=`/bin/get_key_value ${IFCFG_FILE} LOCAL_LAN`
+		local BOOTPROTO=`get_key_value ${IFCFG_FILE} BOOTPROTO`
+		if [ ! -d "/sys/class/net/${ifn}/bridge" -o "${BOOTPROTO}" != "static" -o "$LOCAL_LAN" != "yes" ]; then
+			continue;
+		fi
+
+		local IPADDR=`get_key_value ${IFCFG_FILE} IPADDR`
+		local NETMASK=`get_key_value ${IFCFG_FILE} NETMASK`
+		local CIDR_PREFIX=`ipcalc -p ${IPADDR} ${NETMASK} | cut -d'=' -f2`
+		local CIDR_IP=`ipcalc -n ${IPADDR} ${NETMASK} | cut -d'=' -f2`
+		local CIDR="${CIDR_IP}/${CIDR_PREFIX}"
+
+		iptables -t nat -D POSTROUTING -s ${CIDR} -j MASQUERADE
+	done
+}
+
+disable_nat ()
+{
+	local S01Scripts="/usr/syno/etc/rc.d/S01iptables.sh"
+
+	disable_nat_rule
+	disable_dnat
+	nat_stop_dhcpd
+
+	if [ -x ${S01Scripts} ]; then
+		${S01Scripts} unload_nat_mod
+	fi
+
+	[ -e /etc/dhcpd/dhcpd.info ] && \
+	grep "enable=\"yes\"" /etc/dhcpd/dhcpd.info
+	if [ ! $? -eq 0 ]; then
+		killall dnsmasq
+	fi
+	return 0
+}
+
+addWPSconf ()
+{
+	local wpa_psk="/etc/hostapd.psk"
+
+	if [ ! -e ${wpa_psk} ]; then
+		/bin/touch ${wpa_psk}
+	fi
+}
+
+# if wireless.conf is not exist, and input interface is wireless if
+checkWirelessIf()
+{
+	local input_if="$1"
+	local wireless_conf="/usr/syno/etc/wireless.conf"
+	local topology=`get_key_value /etc/synoinfo.conf net_topology`
+	local support_pci_wifi=`get_key_value /etc/synoinfo.conf support_pci_wifi`
+
+	if [ "yes" != "$support_pci_wifi" ]; then
+		return 0
+	fi
+
+	if [ -f "$wireless_conf" -o "sta" != "$topology" ]; then
+		return 0
+	fi
+
+	if [ -d "/sys/class/net/$input_if/wireless" ]; then
+		return 1
+	fi
+
+	return 0
+}
+
+check_mac_filter() #$1: hostapd conf
+{
+	local mfscript="/etc/hostapd/mac_filter/mfscript.sh"
+	if [ ! -x "$mfscript" ]; then
+		return;
+	fi
+	$mfscript start $1
+}
+
+kill_hostapd ()
+{
+	local killed=0
+	local ifn="$1"
+	local i=0
+	local max=10
+
+	if [ "x$ifn" = "x" ]; then
+		echo "Interface is empty." >> /var/log/messages
+		return -1
+	fi
+
+	while [ $i -lt $max ]; do
+		local pids=""
+
+		for each in `ls /proc | egrep ^[0-9]`; do
+			grep "hostapd-${ifn}\.conf" /proc/${each}/cmdline 1>/dev/null 2>&1
+
+			if [ 0 -eq $? ]; then
+				pids="${pids} ${each}";
+			fi
+		done
+
+		if [ "x${pids}" = "x" ]; then
+			break
+		fi
+
+		killed=1
+
+		for pid in ${pids}; do
+			/bin/kill -15 ${pid} 1>/dev/null 2>&1
+		done
+
+		sleep 1
+		i=`expr $i + 1`
+	done
+
+	return $killed
+}
+
+activate_ap ()
+{
+	local wireless_ap_conf="/usr/syno/etc/wireless_ap.conf"
+	local wireless_info="/tmp/wireless.info"
+	local wireless_dev_section=`/bin/get_key_value ${wireless_info} PRODUCT`
+	local isUnblock="yes"
+	local RFKILL_SH="/usr/syno/etc/rfkill.sh"
+
+	if [ -d /initrd ]; then
+		isUnblock=`/usr/syno/bin/get_section_key_value ${wireless_ap_conf} ${wireless_dev_section} unblock`
+	fi
+
+	if [ -f ${RFKILL_SH} -a "no" = "${isUnblock}" ]; then
+		${RFKILL_SH} blockall
+	fi
+
+	for ifn in ${network_interfaces}; do
+		local HOSTAPD_CONF="/etc/hostapd/hostapd-${ifn}.conf"
+		local HOSTAPD_INFO="/etc/hostapd/hostapd-${ifn}.info"
+		local HOSTAPD_HOST_CONF="/etc/hostapd/hostapd-${ifn}-host.conf"
+		local HOSTAPD_GUEST_CONF="/etc/hostapd/hostapd-${ifn}-guest.conf"
+		local HOSTAPD_GUEST_INFO="/etc/hostapd/hostapd-${ifn}-guest.info"
+		if [ ! -f ${HOSTAPD_CONF} -a ! -f ${HOSTAPD_HOST_CONF} ]; then
+			continue
+		fi
+		if [ ! -f ${HOSTAPD_INFO} ]; then
+			continue
+		fi
+		local HOSTAPD_ENABLE=`/bin/get_key_value ${HOSTAPD_INFO} enable`
+		local HOSTAPD_GUEST_ENABLE="no"
+		if [ -s ${HOSTAPD_GUEST_INFO} ]; then
+			HOSTAPD_GUEST_ENABLE=`/bin/get_key_value ${HOSTAPD_GUEST_INFO} enable`
+		fi
+		if [ "${HOSTAPD_ENABLE}" = "yes" -a -d /sys/class/net/${ifn} -a "${isUnblock}" != "no" ]; then
+
+			kill_hostapd ${ifn}
+
+			if [ "$WIFI_MODEL" = "" ]; then
+				/usr/syno/etc/rc.d/S01tc.sh force-reload
+			fi
+
+			addWPSconf
+			if [ -s ${HOSTAPD_HOST_CONF} ]; then
+				check_mac_filter "${HOSTAPD_HOST_CONF}"
+				cat $HOSTAPD_HOST_CONF > $HOSTAPD_CONF
+				if [ "${HOSTAPD_GUEST_ENABLE}" = "yes" ]; then
+					check_mac_filter "${HOSTAPD_GUEST_CONF}"
+					cat $HOSTAPD_GUEST_CONF >> $HOSTAPD_CONF
+				fi
+			else
+				check_mac_filter "${HOSTAPD_CONF}"
+			fi
+			local hw_mode=`iwconfig ${ifn} | grep "IEEE 802\.11a" `
+			if [ "$hw_mode" != "" ]; then
+				iwlist ${ifn} scan >&/dev/null 2>&1
+			fi
+
+			hostapd ${HOSTAPD_CONF} >&/dev/null &
+
+			# Workaround: if the device is not ready, enable hostapd again.
+			`sleep 3; \
+			[ "x" = "x$(pidof hostapd)" ] && echo "failed to enable hostapd, enable again" >> /var/log/messages 2>&1 && \
+			hostapd ${HOSTAPD_CONF} -B >&/dev/null` &
+		fi
+	done
+	return 0
+}
+
+disable_ap ()
+{
+	for ifn in ${network_interfaces}; do
+		kill_hostapd ${ifn}
+
+		if [ $? -eq 1 ]; then
+			if [ "$WIFI_MODEL" != "" ]; then
+				continue;
+			fi
+			/usr/syno/etc/rc.d/S01tc.sh flush ${ifn}
+		fi
+	done
+
+	return 0
+}
+
+recovery_ap ()
+{
+	local wireless_ap_conf="/usr/syno/etc/wireless_ap.conf"
+	local wireless_info="/tmp/wireless.info"
+	local wireless_dev_section=`/bin/get_key_value ${wireless_info} PRODUCT`
+	local isUnblock="yes"
+
+	if [ -d /initrd ]; then
+		isUnblock=`/usr/syno/bin/get_section_key_value ${wireless_ap_conf} ${wireless_dev_section} unblock`
+	fi
+
+	local STA_IP_LIST=`/etc/hostapd/stainfo.sh |  awk '{print $4}'`
+	local count=1
+	for ip in $STA_IP_LIST; do
+		#echo $ip
+		#echo $count
+		if [ "-" = $ip ]; then
+			continue
+		fi
+
+		/bin/ping -W 5 -w 5 -c 1 $ip > /dev/null
+		if [ 0 -eq $? ]; then
+			return
+		fi
+
+		if [ 5 -eq $((count++)) ]; then
+			break
+		fi
+	done
+
+	for ifn in ${network_interfaces}; do
+		local HOSTAPD_CONF="/etc/hostapd/hostapd-${ifn}.conf"
+		local HOSTAPD_INFO="/etc/hostapd/hostapd-${ifn}.info"
+		if [ ! -f ${HOSTAPD_CONF} -o ! -f ${HOSTAPD_INFO} ]; then
+			continue
+		fi
+		local HOSTAPD_ENABLE=`/bin/get_key_value ${HOSTAPD_INFO} enable`
+		if [ "${HOSTAPD_ENABLE}" = "yes" -a -d /sys/class/net/${ifn} -a "${isUnblock}" = "yes" ]; then
+			local HOSTAPD_PID=`pidof hostapd`
+			while [ -n "${HOSTAPD_PID}" ]; do
+				kill -15 ${HOSTAPD_PID}
+				sleep 3 # make sure hostapd is killed
+				HOSTAPD_PID=`pidof hostapd`
+			done
+
+			addWPSconf
+			check_mac_filter "${HOSTAPD_CONF}"
+			while [ -z "${HOSTAPD_PID}" ]; do
+				hostapd ${HOSTAPD_CONF} >&/dev/null &
+				sleep 5
+				HOSTAPD_PID=`pidof hostapd`
+			done
+		fi
+	done
+	return 0
+}
+
+activate_bridge () # $1=br0
+{
+	unset FN_BONDING_MASTERS DN_BONDDEV SKIP_ENSLAVE DEVICE BRIDGE PRIMARY LOCAL_LAN
+
+	[ $# -ne 0 ] || return
+
+	if [ -d /sys/class/net/$1 ]; then
+		# delete exist bridge
+		ip link set dev $1 down
+		brctl delbr $1
+	fi
+
+	/usr/syno/sbin/brctl addbr $1
+	for device in `grep -l "^BRIDGE=$1" /etc/sysconfig/network-scripts/ifcfg-*` ; do
+		DEVICE=`basename ${device} | cut -d '-' -f 2`
+		ifconfig ${DEVICE} 0.0.0.0
+		# Config bridge of wlan in /etc/hostapd/hostapd.conf and controlled by hostapd (activate_ap)
+		find=`echo "${DEVICE}" | grep -c wlan`
+		if [ $find -eq 1  ]; then
+			continue
+		fi
+		/usr/syno/sbin/brctl addif $1 ${DEVICE}
+	done
+	/usr/syno/sbin/brctl setfd $1 1
+	/sbin/ip link set dev $1 up
+
+	return 0
+}
+
+disable_bridge () # $1=br0
+{
+	unset FN_BONDING_MASTERS DN_BONDDEV REVERSE_SLAVES BRIDGE
+
+	/sbin/ip link set dev $1 down
+	/usr/syno/sbin/brctl delbr $1
+
+}
+
+install_bonding_driver () # $1=bond0 $2=BONDING_OPTS
+{
+	unset FN_BONDING_MASTERS DN_BONDDEV SKIP_ENSLAVE DEVICE
+	FN_BONDING_MASTERS="/sys/class/net/bonding_masters"
+	DN_BONDDEV="/sys/class/net/$1/bonding"
+	[ ! -f ${FN_BONDING_MASTERS} ] && ( insmod /lib/modules/bonding.ko || return 1 )
+	echo "+$1" > ${FN_BONDING_MASTERS}
+
+	/sbin/ip link set dev $1 down
+
+	# add the bits to setup driver parameters here
+	for arg in $2 ; do   
+		key=${arg%%=*};
+		value=${arg##*=};
+		echo $value > ${DN_BONDDEV}/$key
+	done
+
+	/sbin/ip link set dev $1 up
+	for device in `grep -l "^MASTER=$1" /etc/sysconfig/network-scripts/ifcfg-*` ; do
+		SKIP_ENSLAVE=0
+		DEVICE=`basename ${device} | cut -d '-' -f 2`
+		for slv_dev in `cat ${DN_BONDDEV}/slaves`
+		do
+			if [ "${slv_dev}" = "${DEVICE}" ]; then 
+				SKIP_ENSLAVE=1
+				break
+			fi
+		done
+
+		if [ "${SKIP_ENSLAVE}" -eq 0 ]; then
+			/sbin/ip link set dev ${DEVICE} down
+			echo "+${DEVICE}" > ${DN_BONDDEV}/slaves 2>/dev/null
+			/sbin/ip link set dev ${DEVICE} up
+		fi
+	done
+	/sbin/ip link set dev $1 up
+	return 0
+}
+
+unset_bonding_driver () # $1=bond0
+{
+	unset FN_BONDING_MASTERS DN_BONDDEV REVERSE_SLAVES
+	FN_BONDING_MASTERS="/sys/class/net/bonding_masters"
+	DN_BONDDEV="/sys/class/net/$1/bonding"
+	REVERSE_SLAVES=""
+	[ ! -f ${FN_BONDING_MASTERS} ] && return 0
+
+	for slv_dev in `cat ${DN_BONDDEV}/slaves`
+	do
+		/sbin/ip link set dev ${slv_dev} down
+	done
+	/sbin/ip link set dev $1 down
+	echo "-$1" > ${FN_BONDING_MASTERS}
+}
+
+SupportMTU=`/bin/get_key_value /etc.defaults/synoinfo.conf supportMTU`
+get_mtu_value()
+{
+	local ifname="$1"
+	local mtu_value=""
+	local speed=""
+
+	if [ "$SupportMTU" != "yes" -o ! -x "/usr/syno/bin/synoethinfo" ]; then
+		# synoethinfo does not exist in network install mode
+		return
+	fi
+	mtu_value=`/bin/get_key_value /etc/synoinfo.conf ${ifname}_mtu`
+	if [ $? -ne 1 ]; then
+		return
+	fi
+
+	speed=`/usr/syno/bin/synoethinfo "$ifname" | grep "Link Speed" | cut -f 2 -d: `
+	if [ "$speed" -eq 1000 -o "$speed" -eq 10000 ]; then
+		echo "$mtu_value" && return
+	# in some special cases, ISP provide mtu less than 1500, we need to apply these change
+	elif [ "$mtu_value" -lt 1500 ]; then
+		echo "$mtu_value" && return
+	fi
+}
+
+check_interfaces()
+{
+	local ext_ifn_exist="no"
+	CWD=`pwd`
+	cd /etc/sysconfig/network-scripts
+	rm -f ifcfg-*tmp* ifcfg-*.saved
+
+	if [ $# -le 0 ]; then
+		all_network_interfaces=`ls ifcfg* | cut -d'-' -f 2`
+	else
+		all_network_interfaces="$@"
+	fi
+	network_interfaces=""
+	for thisif in $all_network_interfaces;
+	do
+		echo "${thisif}" | grep -c mon > /dev/null 2>&1
+		if [ $? -eq 0  ]; then
+			continue
+		fi
+
+		unset SLAVE BOOTPROTO BONDING_OPTS IPV6INIT TYPE BRIDGE PRIMARY LOCAL_LAN
+		ThisIfConf="/etc/sysconfig/network-scripts/ifcfg-${thisif}"
+		if [ ! -r ${ThisIfConf} ]; then
+			continue;
+		fi
+		# filter out slave device
+		eval $(grep "^SLAVE=" ${ThisIfConf})
+		if [ "$SLAVE" = "yes" ]; then
+			continue
+		fi
+		network_interfaces="$network_interfaces ${thisif}"
+
+		if [ "$(grep "VLAN_ROW_DEVICE=" ${ThisIfConf})" ]; then
+			continue;
+		fi
+
+		eval $(grep "^BONDING_OPTS=" ${ThisIfConf})
+		if [ -n "${BONDING_OPTS}" ]; then
+			eval \Bond_${thisif}='${BONDING_OPTS}'
+		fi
+
+		eval $(grep "^TYPE=" ${ThisIfConf})
+		eval \TYPE_${thisif}='${TYPE}'
+		eval $(grep "^BRIDGE=" ${ThisIfConf})
+		eval \BRIDGE_${thisif}='${BRIDGE}'
+		eval $(grep "^PRIMARY=" ${ThisIfConf})
+		eval \PRIMARY_${thisif}='${PRIMARY}'
+		eval $(grep "^LOCAL_LAN=" ${ThisIfConf})
+		eval \LOCAL_LAN_${thisif}='${LOCAL_LAN}'
+
+		# set up ipv4 parameters
+		eval $(grep "^BOOTPROTO=" ${ThisIfConf})
+		if [ "${BOOTPROTO}" = "static" -o "${thisif}" = "lo" ]; then
+			unset IPADDR NETMASK IP MASK MTU MTU_VALUE
+			MTU_VALUE=`get_mtu_value ${thisif}`
+			eval $(grep "^IPADDR=" ${ThisIfConf})
+			eval $(grep "^NETMASK=" ${ThisIfConf})
+			IP="" ; [ -n "${IPADDR}" ] && IP="inet ${IPADDR}"
+			MASK="" ;  [ -n "${NETMASK}" ] && MASK="netmask ${NETMASK}"
+			MTU="" ; [ -n "${MTU_VALUE}" ] && MTU="mtu ${MTU_VALUE}"
+			if [ -n "${IP}" ]; then
+				thisvalue="${IP} ${MASK} ${MTU}"
+			else
+				thisvalue="dhcp"
+			fi
+			eval \ifconfig_${thisif}='$thisvalue'
+		elif [ "${BOOTPROTO}" = "none" ]; then
+			unset MTU MTU_VALUE
+			MTU_VALUE=`get_mtu_value ${thisif}`
+			MTU="" ; [ -n "${MTU_VALUE}" ] && MTU="mtu ${MTU_VALUE}"
+			thisvalue="inet 0.0.0.0 ${MTU}"
+			eval \ifconfig_${thisif}='$thisvalue'
+		else
+			eval \ifconfig_${thisif}='dhcp'
+		fi
+		#set up ipv6 parameters
+		eval $(grep "^IPV6INIT=" ${ThisIfConf})
+		eval \ifconfig_v6init_${thisif}='$IPV6INIT'
+		if [ "${IPV6INIT}" = "static" ]; then
+			unset IPV6ADDR IPV6_DEFAULTGW IPV6PREFIXLENG
+			eval $(grep "^IPV6ADDR=" ${ThisIfConf})
+			eval $(grep "^IPV6_DEFAULTGW=" ${ThisIfConf})
+			eval $(grep "^IPV6PREFIXLENG=" ${ThisIfConf})
+			eval \ifconfig_v6ip_${thisif}='$IPV6ADDR'
+			eval \ifconfig_v6gw_${thisif}='$IPV6_DEFAULTGW'
+			eval \ifconfig_pxleng_${thisif}='$IPV6PREFIXLENG'
+		fi
+	done
+
+	# If all interfaces are local lan ,
+	# the routing table should not be modified
+	for ifn in ${network_interfaces}; do
+		eval local_lan=\$LOCAL_LAN_${ifn}
+		if [ "${local_lan}" != "yes" ]; then
+			ext_ifn_exist="yes"
+			break
+		fi
+	done
+
+	if [ "${ext_ifn_exist}" != "yes" ]; then
+		return
+	fi
+
+	cd $CWD
+
+	ConfList="/etc/sysconfig/network"
+	for ThisConfig in $ConfList;
+	do
+		if [ -r "$ThisConfig" ]; then
+			. $ThisConfig
+		fi
+	done
+
+	if [ -n "${GATEWAY}" -a "${NETWORKING}" = "yes" ]; then
+		defaultrouter="${GATEWAY}"
+	fi
+}
+
+set_mac_address()
+{
+	local iface=$1
+	local macIndex=${iface//eth/}
+	local notnumber=${macIndex//[0-9]/}
+	if [ -n "${notnumber}" ]; then
+		# mac index is not a number so this is not a real DEVICE
+		# theoritically, $1 should be eth0, eth1, eth2 ....
+		# so when the string part eth was removed, only the numerical part will be left
+		return;
+	fi
+	macIndex=`expr ${macIndex} + 1`
+	local maxLan=`/bin/get_key_value /etc.defaults/synoinfo.conf maxlanport`
+	if [ -z "${maxLan}" ]; then
+		# no maxlanport means this is 1 lan machine
+		maxLan=1;
+	fi
+	if [ ${macIndex} -gt ${maxLan} ]; then
+		# exceed max lan support of DS
+		return;
+	fi
+	local macFile="/proc/sys/kernel/syno_mac_address${macIndex}"
+	if [ ! -e "${macFile}" ]; then
+		# no such a file means this is not 2.6.32 kernel
+		return;
+	fi
+	local macAddr=`cat /proc/sys/kernel/syno_mac_address${macIndex}`
+	if [ -z "${macAddr}" ]; then
+		# no mac address found
+		if [ -z "${rndMac}" ]; then
+		# can not find random mac
+			rndMac=${RANDOM}${RANDOM}
+			rndMac=${rndMac:0:12}
+		else
+			rndMac=`expr ${rndMac} + 1`
+		fi
+		macAddr=`printf '%012x' ${rndMac}`
+	fi
+	ifconfig $1 hw ether ${macAddr} > /dev/null 2>&1
+}
+
+setup_interface_ip()
+{
+	checkWirelessIf ${ifn}
+	if [ 1 -eq $? ]; then
+		continue;
+	fi
+
+	# check if interface exists
+	local tmpdev=`/bin/grep $ifn /proc/net/dev` > /dev/null 2>&1     
+	if [ -z "$tmpdev" ]; then               
+		continue;                                 
+	fi
+
+	case ${ifconfig_args} in
+	'')
+		;;
+	[Dd][Hh][Cc][Pp])
+		# DHCP inits are done all in one go below
+		dhcp_interfaces="$dhcp_interfaces $ifn"
+		;;
+	*) #for 'static' and 'none'
+		ifconfig ${ifn} ${ifconfig_args}
+	esac
+
+	# Configure IPv6
+	# ra0 (wireless) network start is done in scemd, because of hotplug
+	# module not loaded dont do ipv6 operation
+	if [ -z "${ifIpv6}" ]; then
+		return;
+	fi
+	if [ "yes" = "${ipv4only}" -o "off" = "${ifconfig_v6init}" ]; then
+		echo 1 > /proc/sys/net/ipv6/conf/${ifn}/disable_ipv6
+	else 
+		echo 0 > /proc/sys/net/ipv6/conf/${ifn}/disable_ipv6
+		if [ "static" = "${ifconfig_v6init}" ]; then
+			# if static, then add ipv6 address and default gw
+			if [ -n "${ifconfig_v6ip}"  ]; then
+				# if we get prefix leng, then tag prefixleng with ipv6 address
+				if [ -n "${ifconfig_pxleng}" ]; then
+					/sbin/ip -6 addr add ${ifconfig_v6ip}/${ifconfig_pxleng} dev ${ifn}
+				else
+					/sbin/ip -6 addr add ${ifconfig_v6ip} dev ${ifn}
+				fi
+				if [ -n "${ifconfig_v6gw}" ]; then
+					/sbin/ip -6 route add default via ${ifconfig_v6gw} dev ${ifn}
+				fi
+			fi
+		elif [ "dhcp" = "${ifconfig_v6init}" ]; then
+			/sbin/dhcp6c -c /etc/wide-dhcpv6/dhcp6c.conf.${ifn} ${ifn}
+		fi
+	fi
+}
+
+do_start_vlan_interface()
+{
+	local ifn=$1
+	local ifconfigFile=""
+
+	#form config files
+	local BOOTPROTO
+	local VLAN_ROW_DEVICE
+	local VLAN_ID
+	local IPADDR
+	local NETMASK
+	local IPV6INIT
+	
+	#local operation use
+	local MTU_VALUE
+	local IP
+	local MASK
+	local MTU
+
+	#for set ip
+	local ifconfig_args
+	local ifconfig_pxleng
+	local ifconfig_v6ip
+	local ifconfig_v6gw
+	local ifconfig_v6init
+	
+	ifconfigFile="/etc/sysconfig/network-scripts/ifcfg-${ifn}"
+
+	if ! source  "$ifconfigFile" ; then
+		return
+	fi
+
+	vconfig add $VLAN_ROW_DEVICE $VLAN_ID
+	
+	# set up ipv4 parameters
+	if [ "${BOOTPROTO}" = "static" ]; then
+		MTU_VALUE=`get_mtu_value ${ifn}`
+		IP="" ; [ -n "${IPADDR}" ] && IP="inet ${IPADDR}"
+		MASK="" ;  [ -n "${NETMASK}" ] && MASK="netmask ${NETMASK}"
+		MTU="" ; [ -n "${MTU_VALUE}" ] && MTU="mtu ${MTU_VALUE}"
+		if [ -n "${IP}" ]; then
+			thisvalue="${IP} ${MASK} ${MTU}"
+		else
+			thisvalue="dhcp"
+		fi
+		ifconfig_args=$thisvalue
+	else
+		ifconfig_args='dhcp'
+	fi
+	#set up ipv6 parameters
+	ifconfig_v6init=$IPV6INIT
+	if [ "${IPV6INIT}" = "static" ]; then
+		ifconfig_v6ip=$IPV6ADDR
+		ifconfig_v6gw=$IPV6_DEFAULTGW
+		ifconfig_pxleng=$IPV6PREFIXLENG
+	fi
+	
+	setup_interface_ip
+}
+
+
+start_vlan_interfaces()
+{
+	SYNOLoadModules ${VLAN_MODULES}
+
+	local ifn
+	for ifn in ${vlan_interface}; do
+		do_start_vlan_interface $ifn
+	done
+}
+
+start_network()
+{
+	dhcp_timeoutflags="-t 30"
+	dhcp_interfaces=""
+	local ipv4only=`get_key_value /etc.defaults/synoinfo.conf ipv4only`
+	local ifIpv6=$(lsmod | grep ipv6 )
+	local ONBOOT=""
+	local bridge_interfaces=""
+	local vlan_interface=""
+	local ifconfigFile=""
+	local BOOT_SEQ_FILE="/tmp/boot_seq.tmp"
+	local boot_seq=`get_key_value $BOOT_SEQ_FILE STEP`
+	local BOOT_SEQ_BOOT_DONE="4"
+	for ifn in ${network_interfaces}; do
+
+		ifconfigFile="/etc/sysconfig/network-scripts/ifcfg-${ifn}"
+		if [ "$(grep VLAN_ROW_DEVICE $ifconfigFile)" ]; then
+			vlan_interface="${vlan_interface} ${ifn}"
+			continue
+		fi
+
+		#set_mac_address ${ifn}
+		eval bond_opt=\$Bond_${ifn}
+		[ -n "${bond_opt}" ] && install_bonding_driver ${ifn} "${bond_opt}"
+
+		ONBOOT=`get_key_value /etc/sysconfig/network-scripts/ifcfg-${ifn} ONBOOT`
+		if [ "${ONBOOT}" != "yes" ]; then
+			continue;
+		fi
+
+		eval device_type=\$TYPE_${ifn}
+		if [ "${device_type}" = "bridge" ]; then
+			SYNOLoadModules ${BRIDGE_MODULES}
+			activate_bridge ${ifn}
+			bridge_interfaces="${bridge_interfaces} ${ifn}"
+		fi
+
+		eval bridge_if=\$BRIDGE_${ifn}
+		if [ -n "${bridge_if}" ]; then
+			continue
+		fi
+	
+	
+		# Do the primary ifconfig if specified
+		eval ifconfig_args=\$ifconfig_${ifn}
+		eval ifconfig_pxleng=\$ifconfig_pxleng_${ifn}
+		eval ifconfig_v6ip=\$ifconfig_v6ip_${ifn}
+		eval ifconfig_v6gw=\$ifconfig_v6gw_${ifn}
+		eval ifconfig_v6init=\$ifconfig_v6init_${ifn}
+
+		setup_interface_ip
+	done
+
+	if [ -n "${vlan_interface}" ]; then
+		start_vlan_interfaces
+	fi
+	
+	# add bridge mac address change here
+	for ifn in ${bridge_interfaces}; do
+		eval primary_if=\$PRIMARY_${ifn}
+		if [ -n "${primary_if}" ]; then
+			local mac_addr=`ifconfig ${primary_if} | grep HWaddr | cut -d"W" -f2| cut -d"r" -f2`
+			ifconfig ${ifn} hw ether ${mac_addr}
+		fi
+	done
+
+	if [ ! -z "${dhcp_interfaces}" ]; then
+		if [ -x /sbin/udhcpc ]; then
+			for dhcpif in ${dhcp_interfaces}
+			do
+				ifconfig ${dhcpif} 0.0.0.0 up
+				udhcp_flags="-p /etc/dhcpc/dhcpcd-${dhcpif}.pid -b -h `hostname`"
+				${dhcp_program:-/sbin/udhcpc} -i ${dhcpif} ${udhcp_flags}
+				sleep 1;
+			done
+		else
+			dhcp_flags="-n ${dhcp_flags}"
+			for dhcpif in ${dhcp_interfaces}
+			do
+				unset MTU MTU_VALUE
+				MTU_VALUE=`get_mtu_value ${dhcpif}`
+				MTU="" ; [ -n "${MTU_VALUE}" ] && MTU="mtu ${MTU_VALUE}"
+
+				# BUG #40656, WIFI model setup wifi client in /etc/rc,
+				# so it doesn't need to init wlan0 at rc.network start when system boot
+				if [ "wlan0" = "${dhcpif}" -a "${BOOT_SEQ_BOOT_DONE}" != "${boot_seq}" ]; then
+					continue
+				fi
+				ifconfig ${dhcpif} 0.0.0.0 up ${MTU}
+				${dhcp_program:-/sbin/dhcpcd} ${dhcp_flags} ${dhcpif} ${dhcp_timeoutflags}
+				sleep 1                                            
+			done
+		fi
+	fi
+
+	#showstat
+	ifconfig
+
+	/etc/rc.network_routing ${defaultrouter} &
+
+	set_kernel_topology_mode
+}
+
+stop_vlan_interfaces()
+{
+	local ifconfigFile
+	local VLAN_ROW_DEVICE
+	local VLAN_ID
+
+	local ifn
+	for ifn in ${vlan_interface}; do
+		ifconfigFile="/etc/sysconfig/network-scripts/ifcfg-${ifn}"
+		source $ifconfigFile
+		ifconfig ${ifn} down
+		vconfig rem $VLAN_ROW_DEVICE.$VLAN_ID
+	done
+	if [ -r /proc/net/vlan/config ] && [ `cat /proc/net/vlan/config |wc -l` -le 2 ]; then
+		SYNOUnloadModules ${VLAN_MODULES}
+	fi
+}
+
+kill_dhcp_processes()
+{
+	local ifn=$1
+	local dhcp
+	local pid
+	local all_dhcp_processes="udhcpc dhcpcd dhcp6c"
+
+	for dhcp in ${all_dhcp_processes}; do
+		pid=`ps | grep ${dhcp} | grep ${ifn} | awk '{print $1}'`
+		if [ -n "${pid}" ]; then
+			kill -15 ${pid}
+			kill  -9 ${pid}
+		fi
+	done
+}
+
+stop_network()
+{	
+	none_vlan_interfaces=""
+	vlan_interfaces=""
+    dhcp_interfaces=""
+
+	for ifn in ${network_interfaces}; do
+		kill_dhcp_processes $ifn
+	done
+
+	for ifn in ${network_interfaces}; do
+		ifconfigFile="/etc/sysconfig/network-scripts/ifcfg-${ifn}"
+		if [ "$(grep VLAN_ROW_DEVICE $ifconfigFile)" ]; then
+			vlan_interface="${vlan_interface} ${ifn}"
+			continue
+		fi
+		none_vlan_interface="${none_vlan_interface} ${ifn}"
+	done
+	
+	if [ -n "${vlan_interface}"  ]; then
+		stop_vlan_interfaces
+	fi
+
+	for ifn in ${none_vlan_interface}; do
+		if [ -d "/sys/class/net/${ifn}/bridge/" ]; then
+			disable_bridge ${ifn}
+		fi
+		#then stop networking
+		eval bond_opt=\$Bond_${ifn}
+		[ -n "${bond_opt}" ] && unset_bonding_driver ${ifn}
+		ifconfig ${ifn} inet 0.0.0.0 down
+	done
+	check_topology_mode
+	[ $? -eq 1 ] && SYNOUnloadModules ${BRIDGE_MODULES}
+
+# Debug only
+	ifconfig
+
+	# Configure routing
+	#
+	case ${defaultrouter} in
+		[Nn][Oo] | '')
+			;;
+		*)
+			echo "Del default router ${defaultrouter}"
+			/bin/ip route del default via ${defaultrouter}
+			;;
+	esac
+}
+
+start_pppoe()
+{
+	pppoe_enable=`grep pppoe_enable /etc/synoinfo.conf | awk -F \" '{print $2}'`
+	
+	case $pppoe_enable in
+	[Yy][Ee][Ss])
+		echo "Starting PPPoE..."
+		/usr/bin/env BOOT_TIME=yes /usr/sbin/adsl-start
+		;;
+	esac
+}
+
+stop_pppoe()
+{
+	/usr/sbin/adsl-stop
+}
+
+check_wifi_schedule()
+{
+	local TMP_WIFI_SCHEDULER="/tmp/synowifischeduler"
+	local TMP_GUEST_NET_SCHEDULER="/tmp/synoguestnetscheduler"
+
+	if [ -f ${TMP_WIFI_SCHEDULER} -a -f ${TMP_WIFI_AP_CONF} ]; then
+		local TMP_WIFI_AP_CONF="/tmp/wireless_ap.conf"
+		local WIRELESS_CONF="/tmp/wireless.info"
+		local WIFI_SECTION=`get_key_value ${WIRELESS_CONF} PRODUCT`
+		local WIFI_SCHED_ENABLED=`get_section_key_value ${TMP_WIFI_AP_CONF} ${WIFI_SECTION} wifi_sched_enabled`
+		local GUEST_NET_SCHED_ENABLED=`get_section_key_value ${TMP_WIFI_AP_CONF} ${WIFI_SECTION} guest_net_sched_enable`
+
+		if [ "x${WIFI_SCHED_ENABLED}" = "x1" -o "x${GUEST_NET_SCHED_ENABLED}" = "x1" ]; then
+			${TMP_WIFI_SCHEDULER}
+		fi
+	fi
+}
+
+# return:
+# 0 - disable
+# 1 - enable
+# 2 - not support
+is_gnet_access_rule_enable()
+{
+	local support_pci_wifi=`get_key_value /etc/synoinfo.conf support_pci_wifi`
+	local WIRELESS_AP_CONF="/usr/syno/etc/wireless_ap.conf"
+	local WIRELESS_INFO="/tmp/wireless.info"
+
+	if [ "yes" != "$support_pci_wifi" ]; then
+		return 2;
+	fi
+
+	if [ ! -f $WIRELESS_AP_CONF ]; then
+		return 2;
+	fi
+
+	local wireless_dev_section=`/bin/get_key_value ${WIRELESS_INFO} PRODUCT`
+	local sched_enable=`/usr/syno/bin/get_section_key_value ${WIRELESS_AP_CONF} ${wireless_dev_section} wifi_sched_enabled`
+	local gnet_sched_enable=`/usr/syno/bin/get_section_key_value ${WIRELESS_AP_CONF} ${wireless_dev_section} guest_net_sched_enable`
+	local gnet_enable=`/usr/syno/bin/get_section_key_value ${WIRELESS_AP_CONF} ${wireless_dev_section} guest_net_enable`
+	local lan_block=`/usr/syno/bin/get_section_key_value ${WIRELESS_AP_CONF} ${wireless_dev_section} guest_net_lan_block`
+	local internet_block=`/usr/syno/bin/get_section_key_value ${WIRELESS_AP_CONF} ${wireless_dev_section} guest_net_internet_block`
+	local isUnblock="yes"
+
+	if [ -d /initrd ]; then
+		isUnblock=`/usr/syno/bin/get_section_key_value ${WIRELESS_AP_CONF} ${wireless_dev_section} unblock`
+	fi
+
+	if [ -z "$gnet_enable" -o -z "$gnet_sched_enable" ]; then
+		return 2
+	fi
+
+	if [ "x$isUnblock" != "xyes" ]; then
+		return 0
+	fi
+
+	if [ "x$gnet_enable" != "x1" ]; then
+		return 0
+	fi
+
+	if [ "x$lan_block" != "x1" -a "x$internet_block" != "x1" ]; then
+		return 0
+	fi
+
+	return 1
+}
+
+activate_gnet_access_rule()
+{
+	local ACCESS_RULE_SCRIPT="/usr/syno/etc/iptables_guest_net.sh"
+
+	is_gnet_access_rule_enable
+	if [ "$?" = "1" ]; then
+		$ACCESS_RULE_SCRIPT ins mod && $ACCESS_RULE_SCRIPT ins all
+	fi
+}
+
+disable_gnet_access_rule()
+{
+	local ACCESS_RULE_SCRIPT="/usr/syno/etc/iptables_guest_net.sh"
+	is_gnet_access_rule_enable
+	local enable=$?
+
+	if [ "$enable" = "2" ]; then
+		return;
+	fi
+
+	$ACCESS_RULE_SCRIPT del all 2> /dev/null
+	if [ "$enable" = "0" ]; then
+		$ACCESS_RULE_SCRIPT del mod 2> /dev/null
+	fi
+}
+
+action=$1
+shift;
+case "$action" in
+stop)
+	check_interfaces "$@"
+	disable_ap
+	disable_nat
+	stop_network
+	;;
+start)
+	check_interfaces "$@"
+	start_network
+	activate_nat
+	activate_ap
+	;;
+restart)
+	check_interfaces "$@"
+	disable_ap
+	disable_nat
+	stop_network
+	start_network
+	activate_nat
+	activate_ap
+	;;
+start-ap)
+	check_interfaces "$@"
+	activate_ap
+	;;
+stop-ap)
+	check_interfaces "$@"
+	disable_ap
+	;;
+restart-ap)
+	check_interfaces "$@"
+	disable_ap
+	activate_ap
+	;;
+recovery-ap)
+	check_interfaces "$@"
+	recovery_ap
+;;
+stop-nat-rule)
+	check_interfaces "$@"
+	disable_nat_rule
+	;;
+stop-nat)
+	check_interfaces "$@"
+	disable_nat
+	;;
+start-nat-rule)
+	check_interfaces "$@"
+	activate_nat_rule
+	;;
+start-nat)
+	check_interfaces "$@"
+	activate_nat
+	;;
+start-dnat)
+	activate_dnat
+	;;
+stop-pppoe)
+	stop_pppoe
+	;;
+start-pppoe)
+	start_pppoe
+	;;
+restart-pppoe)
+	stop_pppoe
+	start_pppoe
+	;;
+nat-add)
+	nat_add_interface "$@"
+	;;
+nat-restart-dhcp)
+	nat_stop_dhcpd "$@"
+	nat_start_dhcpd "$@"
+	;;
+nat-stop-dhcp)
+	nat_stop_dhcpd "$@"
+	;;
+nat-start-dhcp)
+	nat_start_dhcpd "$@"
+	;;
+check-wifi-schedule)
+	check_wifi_schedule
+	;;
+start-guest-nat)
+	check_interfaces "$@"
+	start_network
+	activate_nat
+	;;
+stop-guest-nat)
+	check_interfaces "$@"
+	disable_nat
+	stop_network
+	nat_start_dhcpd
+	;;
+start-guest-net-access-rule)
+	activate_gnet_access_rule
+	;;
+stop-guest-net-access-rule)
+	disable_gnet_access_rule
+	;;
+*)
+	echo "Usage: $0 [start|stop|restart|start-nat-rule|start-nat|stop-nat-rule|stop-nat|start-ap|stop-ap|recovery-ap|start-pppoe|stop-pppoe|restart-pppoe|nat-add|nat-restart-dhcp|nat-start-dhcp|nat-stop-dhcp|check-wifi-schedule|start-guest-nat|stop-guest-nat|start-guest-net-access-rule|stop-guest-net-access-rule]"
+	;;
+esac
+
+exit 0

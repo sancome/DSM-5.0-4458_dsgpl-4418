@@ -1,0 +1,126 @@
+#!/bin/sh
+source /.gnoboot/rc.d/init
+
+gnoBootCmdParamValue()
+{
+	paramName=$1
+	[ -z "${paramName}" ] && return
+	for param in `cat /proc/cmdline`; do
+		if [ "${param//=*}" == "${paramName}" ]; then
+			paramValue=${param//*=} 
+			echo ${paramValue}
+			break
+		fi
+	done
+}
+
+gnoBootCmdParamValues()
+{
+	paramName=$1
+	paramValues=$(gnoBootCmdParamValue "${paramName}")
+	echo ${paramValues//,/ }
+}
+
+gnoBootBlacklistModules()
+{
+	paramValues=$(gnoBootCmdParamValues "rmmod")	
+	for paramValue in ${paramValues}; do
+		RD_MODULES="${RD_MODULES//${paramValue}/}"
+	done
+}
+
+gnoBootLoadExtraModules()
+{
+	paramValues=$(gnoBootCmdParamValues "insmod")	
+	RD_MODULES="${RD_MODULES} ${paramValues}"
+}
+
+gnoBootSetIOSched()
+{
+	ioSched=$1
+	for blk in $(egrep '[sh]d.*[^1-9]$' /proc/partitions | cut -c 26-); do
+		echo ${ioSched:='cfq'} > /sys/block/${blk}/queue/scheduler
+	done
+}
+
+gnoBootLoadModules()
+{
+	for modfile in $(ls -1 ${gnoBoot}/modules.d); do
+		source ${gnoBoot}/modules.d/${modfile}
+	done
+	gnoBootBlacklistModules	
+	gnoBootLoadExtraModules
+	RCMsg "Checking hypervisor" true
+	hypervisor=$(/usr/sbin/virt-what)
+	case ${hypervisor} in 
+		vmware) 
+			echo "Detected hypervisor: ${hypervisor}"
+			SYNOLoadModules ${RD_MODULES} ${VMWARE}
+			gnoBootSetIOSched "noop"
+			;;
+		kvm|xen) 	
+			echo "Detected hypervisor: ${hypervisor}"
+			SYNOLoadModules ${RD_MODULES} ${VIRTIO}
+			if [ ${hypervisor} == "kvm" ]; then
+				gnoBootSetIOSched "deadline"
+			else
+				gnoBootSetIOSched "noop"
+			fi
+			;;
+		hyperv) 
+			echo "Detected hypervisor: ${hypervisor}"
+			SYNOLoadModules ${RD_MODULES} ${HYPERV}
+			;;
+		*)
+			echo "Detected hypervisor: ${hypervisor}"
+			SYNOLoadModules ${RD_MODULES}
+			;;
+	esac
+}
+
+gnoBootRescanDisk()
+{
+	
+	rescanDisk=0
+	# Stop RAID disk if drivers are not built-in
+	if [ `grep -c md0 /proc/mdstat` -eq 0 ]; then
+		rescanDisk=1
+	fi
+	if [ `grep -c md1 /proc/mdstat` -eq 0 ]; then
+		rescanDisk=1
+	fi
+	
+	[ ${rescanDisk} -eq 1 ] && RCMsg "Re-scanning disks" \
+		/sbin/mdadm --auto-detect
+}
+
+gnoBootCheckCmdParam()
+{
+	if [ $(gnoBootIsCmdParam debug) -eq 1 ]; then
+		echo 1 > /proc/sys/kernel/syno_ata_debug
+		echo 1 > /proc/sys/kernel/syno_debug_flag
+		set -x
+		exec 2> /tmp/gnoboot.debug
+	fi
+
+	if [ $(gnoBootIsCmdParam gnoboot_upgrade) -eq 1 ]; then
+		installVersion=$(gnoBootCmdParamValue gnoboot_upgrade)
+		versionFile="${gnoBoot}/etc/VERSION.${installVersion}"	
+		if [ -e ${versionFile} ]; then
+			gnoUpdateFile ${versionFile} \
+					/etc/VERSION		
+			gnoUpdateFile ${versionFile} \
+					/etc.defaults/VERSION		
+		fi
+	fi
+}
+
+gnoBootInitPre()
+{
+	gnoBootCheckCmdParam
+	gnoBootLoadModules
+	gnoBootRescanDisk
+	gnoBootRegen
+}
+
+gnoBootInitPre

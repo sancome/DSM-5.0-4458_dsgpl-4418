@@ -1,0 +1,768 @@
+#!/bin/sh
+# Copyright (c) 2000-2013 Synology Inc. All rights reserved.
+
+HOME=/
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/syno/sbin:/usr/syno/bin:/usr/local/sbin:/usr/local/bin
+export HOME PATH
+
+mount -o remount,rw /dev/root /
+
+. /etc.defaults/rc.subr
+
+SYNOINFO="/etc/synoinfo.conf"
+SYNOINFO_DEF="/etc.defaults/synoinfo.conf"
+KERNEL_VCODE=`KernelVersionCode $(KernelVersion)`
+
+UNIQUE=`get_key_value $SYNOINFO_DEF unique`
+PLATFORM=`get_key_value $SYNOINFO_DEF unique | cut -d"_" -f2`
+IPv4_ONLY=`get_key_value $SYNOINFO_DEF ipv4only`
+CONFIGURED=`get_key_value $SYNOINFO configured`
+
+SUPPORT_HA=`get_key_value $SYNOINFO_DEF support_ha`
+SUPPORT_RAID=`get_key_value $SYNOINFO_DEF supportraid`
+SUPPORT_SYNOACL=`get_key_value $SYNOINFO_DEF support_synoacl`
+SUPPORT_STARTUPD=`get_key_value $SYNOINFO_DEF supportstartupd`
+SUPPORT_HDD_HOTPLUG=`get_key_value $SYNOINFO_DEF HddHotplug`
+SUPPORT_DUAL_HEAD=`get_key_value $SYNOINFO_DEF support_dual_head`
+
+SZF_HA_RC="/usr/syno/synoha/etc.defaults/rc.ha"
+RUN_HA=`get_key_value $SYNOINFO runha`
+RUN_TUNNEL=`get_key_value $SYNOINFO tunnel_enable`
+RUN_SYNOBIOS=`get_key_value $SYNOINFO synobios`
+SupportSAS=`/bin/get_key_value /etc.defaults/synoinfo.conf supportsas`
+
+BUILDIN_USB_MODULE=`get_key_value $SYNOINFO_DEF buildin_usb_module`
+SUPPORT_USB_VOLUME=`get_key_value $SYNOINFO_DEF support_usb_volume`
+
+RCMsg "Starting /etc/rc" 
+/usr/syno/bin/synobootseq --set-start-etcrc >/dev/null 2>&1
+
+# ti816x use devtmpfs, so we do not need re-gen device nodes, You can see 816x /dev/ttyS* minor > 249
+if [ -d /initrd ] && [ "$PLATFORM" != "powerpc" ] && [ "$PLATFORM" != "ti816x" ] && [ "$SupportSAS" != "yes" ]; then
+	RegenDevNode
+fi
+
+if [ "$PLATFORM" = "ti816x" ]; then
+	if [ ! -d /initrd ]; then
+		mount -t devtmpfs devtmpfs /dev
+	fi
+	mkdir /dev/pts
+fi
+
+# Dump platform information to /.system_info/
+/usr/syno/bin/synoplatform --dump-info
+
+RCMsg "Prepare var" \
+mkdir -p /var
+chmod 755 /var
+
+RCMsg "Mounting procfs" \
+mount -n -t proc /proc /proc
+grep /dev/root /proc/mounts > /etc/mtab
+rm -rf /var/tmp  /var/state/ups/*
+ln -s /tmp /var/tmp
+
+RCMsg "Mounting tmpfs" \
+mount -t tmpfs /tmp /tmp
+# synobootseq write boot state in tmp directory
+/usr/syno/bin/synobootseq --set-start-etcrc >/dev/null 2>&1
+
+RCMsg "Mounting devpts" \
+mount -vt devpts -o gid=4,mode=620 none /dev/pts
+
+[ -f /initrd/tmp/usbinfoall ] && cp -f /initrd/tmp/usbinfoall /tmp/usbinfoall
+[ -d /initrd ] && [ ! -f /.nofree ] && /bin/umount /initrd && /sbin/freeramdisk /dev/ram0
+
+dmesg > /var/run/dmesg.boot
+
+# for device node autogen
+if [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6") ]; then
+	RCMsg "Mounting sysfs" \
+	mount -t sysfs /sys /sys
+fi
+
+# Mindspeed's platform needs further settings
+if [ "x" != "x`/bin/get_key_value /etc.defaults/synoinfo.conf unique | grep comcerto2k`" ]; then
+	. /etc.defaults/rc.mindspeed pfe_insert
+fi
+
+if [ "$SupportSAS" = "yes" ]; then
+	. /etc.defaults/rc.sas
+	SASRemoveSDNode
+fi
+
+support_buildin_storage()
+{
+	local value=`get_key_value $SYNOINFO_DEF support_buildin_storage`
+	[ "xyes" = "x$value" ]
+	return $?
+}
+
+should_burnin_test()
+{
+	# don't do burnin if request memtest (for US3)
+	if [ -f /.memtest ]; then
+		false;
+		return $?;
+	fi
+
+	# built-in storage model always run burnin-test
+	if [ -f /.nodisk ] || support_buildin_storage; then
+		true;
+		return $?;
+	fi
+
+	false;
+	return $?;
+}
+
+SYNOLoadPCIWirelessDriver()
+{
+	local ATH9K_WIRELESS_MODULES="rfkill usbcore led-class compat compat_firmware_class arc4 cfg80211 syno_ipv6_junior mac80211 ath ath9k_hw ath9k_common ath9k"
+	local SupportPCIWifi=`get_key_value ${SYNOINFO_DEF} support_pci_wifi`
+	local WIRELESS_CONF="/usr/syno/etc/pci-wireless.info"
+	local RFKILL_CLASS="/sys/class/rfkill"
+	local hostapd_junior="/etc/hostapd/hostapd-wlan0.conf.junior"
+	local WIFI_AP_MODE=
+
+	if [ "xyes" != "x${SupportPCIWifi}" ]; then
+		return
+	fi
+
+	SYNOLoadModules ${ATH9K_WIRELESS_MODULES}
+	if [ -f ${WIRELESS_CONF} ]; then
+		local WIFI_AP_CONF="/usr/syno/etc/wireless_ap.conf"
+		local TMP_WIFI_AP_CONF="/tmp/wireless_ap.conf"
+		local WIFI_SCHEDULER="/usr/syno/sbin/synowifischeduler"
+		local TMP_WIFI_SCHEDULER="/tmp/synowifischeduler"
+		local WIFI_SECTION=`get_key_value ${WIRELESS_CONF} PRODUCT`
+
+		WIFI_AP_MODE=`get_section_key_value ${WIFI_AP_CONF} ${WIFI_SECTION} enable`
+		cp ${WIRELESS_CONF} /tmp/wireless.info
+
+		if [ -f ${WIFI_AP_CONF} -a -f ${WIFI_SCHEDULER} -a "x${WIFI_AP_MODE}" = "xyes" ]; then
+			local IS_UNBLOCK=`get_section_key_value ${WIFI_AP_CONF} ${WIFI_SECTION} unblock`
+			local WIFI_SCHED_ENABLED=`get_section_key_value ${WIFI_AP_CONF} ${WIFI_SECTION} wifi_sched_enabled`
+			local GUEST_NET_SCHED_ENABLED=`get_section_key_value ${WIFI_AP_CONF} ${WIFI_SECTION} guest_net_sched_enable`
+
+			# Move wifi scheduler to /tmp/
+			if [ "x${WIFI_SCHED_ENABLED}" = "x1" -o "x${GUEST_NET_SCHED_ENABLED}" = "x1" ]; then
+				cp ${WIFI_AP_CONF} ${TMP_WIFI_AP_CONF}
+				cp ${WIFI_SCHEDULER} ${TMP_WIFI_SCHEDULER}
+			fi
+		fi
+	fi
+
+	if [ -d ${RFKILL_CLASS} ]; then
+		local RFKILL_MAJOR=`cat /sys/class/misc/rfkill/dev | cut -d':' -f1`
+		local RFKILL_MINOR=`cat /sys/class/misc/rfkill/dev | cut -d':' -f2`
+
+		/bin/mknod /dev/rfkill c  ${RFKILL_MAJOR} ${RFKILL_MINOR} > /dev/null 2>&1
+	fi
+
+	if [ "xyes" != "x${WIFI_AP_MODE}" -a -f "/usr/syno/etc/wireless.conf" ]; then
+		synowireless -c
+	fi
+
+	if [ -f ${hostapd_junior} ]; then
+		cp ${hostapd_junior} /etc/hostapd/hostapd-wlan0.conf 2>/dev/null
+	fi
+
+}
+
+SYNOLoadIPv6()
+{
+	# see bug 16542, some modules of 824x don't support ipv6
+	# fixed by add this key to minimize the effect
+	local v6install=`get_key_value $SYNOINFO_DEF v6install`
+	# check if ipv4 only platform...
+	if [ "$IPv4_ONLY" = "yes" ]; then
+		# ipv4 only platform but forced to install v6 module..
+		if [ "$v6install" = "yes" ]; then
+			SYNOLoadModules "ipv6"
+		fi
+		return
+	fi
+	SYNOLoadModules "ipv6"
+}
+
+CheckADTDevice()
+{
+	file=/sys/class/hwmon/
+	for f in $file*
+	do
+		if [ -d $f/device ]; then
+			name=`cat $f/device/name`
+			if [ "$name" == "adt7490" ];then
+				return 1
+			fi
+		fi
+	done
+	return 0
+}
+
+SYNOLoadAdt7490()
+{
+	local supportadt7490=`get_key_value $SYNOINFO_DEF supportadt7490`
+
+	if [ "$supportadt7490" = "yes" ]; then
+		SYNOLoadModules i2c-i801 adt7475
+		for retry_count in `seq 1 3`
+		do
+			CheckADTDevice
+			if [ $? -eq 0 ]; then
+				echo Can not detect ADT device, Retry: $retry_count...
+				sleep 1
+				SYNOUnloadModules i2c-i801 adt7475
+				sleep 1
+				SYNOLoadModules i2c-i801 adt7475
+			else
+				break
+			fi
+		done
+	fi
+}
+
+SYNOTunnel()
+{
+	if [ "$IPv4_ONLY" = "yes" ] || [ "$RUN_TUNNEL" != "yes" ]; then
+		return
+	fi
+
+	if [ -x /usr/syno/etc/rc.tun ]; then
+		if [ -x /usr/syno/bin/synotunnelexec ]; then
+			/usr/syno/bin/synotunnelexec boot &
+		fi
+	fi
+}
+
+UpgradeConfig()
+{
+	Event=$1
+	orgVer="/.old_patch_info/VERSION"
+	
+	if [ -f "/.updater" ]; then
+	    if [ -f $orgVer ]; then
+		/.updater -c $Event -p $orgVer
+	    else
+		echo "Skip update config because not found ${orgVer}"
+	    fi
+	else
+	    echo "Skip update config because not found /.updater" 
+	fi
+}
+
+FStab="fstab"
+
+# see if need repartitioning
+/etc/newdisk.sh
+
+if [ "$SUPPORT_DUAL_HEAD" != "yes" ]; then
+	# turn swap on
+	if [ "$SUPPORT_RAID" = "yes" ]; then
+		retTempDevRaid=`grep md9999 /proc/mdstat`
+		if [ "$retTempDeviceRaid" != "" ]; then
+			tempDevRaid="/dev/md9999"
+			mdadm -S $tempDevRaid
+		fi
+		SwapDevice="/dev/md1"
+		CheckSwapRaid
+		if [ "$?" = "1" ]; then
+			mdadm -S $SwapDevice
+			MkSwapRaid
+		fi
+	else
+		SwapDevice="/dev/hda2"
+	fi
+
+	swapon $SwapDevice
+	RetSWAPON=$?
+	if [ "$RetSWAPON" -ne 0 ]; then
+		if [ -d /initrd ]; then
+			echo "RetSWAPON=$RetSWAPON, doing mkswap..."
+			mkswap ${SwapDevice}
+			RetMKSWAP=$?
+			if [ "$RetMKSWAP" -ne 0 -a "$SUPPORT_RAID" = "yes" ]; then
+				echo "RetMKSWAP=$RetMKSWAP, rebuild swap device..."
+				MkSwapRaid
+				RetMKSWAP=$?
+			fi
+			if [ "$RetMKSWAP" -ne 0 ]; then
+				echo "Failed to mkswap:$RetMKSWAP, reboot to network install mode"
+				touch "/.noroot"
+				reboot
+			fi
+			swapon $SwapDevice
+		fi
+	fi
+fi
+
+# show mount_options
+mount -ro /
+
+ConfList="/etc/sysconfig/network"
+for ThisConfig in $ConfList;
+do
+	if [ -r "$ThisConfig" ]; then
+		. $ThisConfig
+	fi
+done
+
+# Set the host name
+HOSTNAME=`get_key_value $SYNOINFO hostname`
+hostname ${HOSTNAME}
+
+grep ${HOSTNAME} /etc/hosts
+if [ "$?" != "0" ]; then
+	echo "0.0.0.0	${HOSTNAME}" >> /etc/hosts
+fi
+
+ThisMachine=`uname -m`
+if [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6") ]; then
+	# 2.6 or 3.x
+	NET_DRIVERS="dca e1000e i2c-algo-bit igb be2net ixgbe"
+	CRYPTO_MODULES="crypto_algapi crypto_wq crypto_blkcipher crypto_hash aead pcompress cryptomgr cbc md5 aes_generic rng cts ansi_cprng krng eseqiv crc32c des_generic chainiv ocf cryptodev rng-core authenc talitos cesa_dev cesa_ocf_drv aes-x86_64 aes-i586 ecb sha1_generic sha256_generic sha512_generic ecryptfs cryptosoft cryptd aesni-intel"
+	RAID_MODULES="dm-mod async_tx async_memcpy xor async_xor raid6_pq async_pq async_raid6_recov linear raid0 raid10 raid456"
+	KERNEL_MODULES="llc p8022 psnap sg usbcore quota_tree quota_v2 crc-ccitt crc-itu-t zlib_inflate dm-snapshot freq_table cpufreq_stats cpufreq thermal_sys processor mperf acpi-cpufreq cpufreq_ondemand cpufreq_performance cpufreq_powersave cpufreq_conservative mdio"
+	KERNEL_I2C_MODLES="i2c-core of_i2c i2c-mpc"
+	if [ "ppc853x" = "$PLATFORM" ]; then
+		KERNEL_MODULES="${RAID_MODULES} ${KERNEL_MODULES} ${CRYPTO_MODULES} ${KERNEL_I2C_MODLES}"
+	elif [ "ppc854x" = "$PLATFORM" ]; then
+		KERNEL_MODULES="${RAID_MODULES} ${KERNEL_MODULES} ${CRYPTO_MODULES}"
+	else
+		KERNEL_MODULES="${KERNEL_MODULES} ${CRYPTO_MODULES}"
+	fi
+	KERNEL_MODULES="${KERNEL_MODULES} fat vfat fuse"
+	if [ $KERNEL_VCODE -ge $(KernelVersionCode "3") ]; then
+	# 3.x
+		KERNEL_MODULES="${KERNEL_MODULES} ${NET_DRIVERS}"
+		KERNEL_MODULES="usb-common ${KERNEL_MODULES} hmac md4 hfsplus crc32c libcrc32c zlib_deflate btrfs"
+	else
+	# 2.6
+		if [ $KERNEL_VCODE -eq $(KernelVersionCode "2.6.37") ]; then
+		    KERNEL_MODULES="${KERNEL_MODULES} hmac md4"
+		fi
+		if [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6.32") ]; then
+		    KERNEL_MODULES="${KERNEL_MODULES} hfsplus"
+	    fi
+	fi
+else
+	# 2.4
+	KERNEL_MODULES="netlink_dev reiserfs scsi_mod sd_mod sg usbcore quota_v2"
+	if [ "${ThisMachine}" = "ppc" ]; then
+		KERNEL_MODULES="${KERNEL_MODULES} zlib_inflate"
+	fi
+	KERNEL_MODULES="${KERNEL_MODULES} fat vfat ntfs"
+fi
+
+if [ "$SUPPORT_SYNOACL" = "yes" ]; then
+	KERNEL_MODULES="${KERNEL_MODULES} synoacl_vfs"
+fi
+
+if [ "$PLATFORM" = "ti816x" ]; then
+	AddExtraKo_for_816x
+fi
+
+if [ "$PLATFORM" = "evansport" ]; then
+	VIDEO_MODULES="i2c-algo-bit button backlight thermal_sys video agpgart intel-gtt intel-agp fbdev drm fb output cfbimgblt cfbcopyarea cfbfillrect drm_kms_helper"
+	KERNEL_MODULES="${KERNEL_MODULES} ${VIDEO_MODULES} udma"
+fi
+
+SYNOLoadIPv6
+SYNOLoadModules ${KERNEL_MODULES}
+SYNOLoadAdt7490
+
+# we need sg.ko before we can assign enclosure id
+if [ "$SupportSAS" = "yes" -a -d /initrd ]; then
+	. /etc.defaults/rc.sas
+	SASAssignEncID
+	SASTunDiskPerformance
+fi
+
+if [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6") ]; then
+	# usbfs need usbcore module
+	RCMsg "Mounting usbfs" \
+	mount -t usbfs /proc/bus/usb /proc/bus/usb
+else
+	RCMsg "Mounting usbdevfs" \
+	mount -t usbdevfs /proc/bus/usb /proc/bus/usb
+fi
+
+case "${ThisMachine}" in
+armv5tel)
+	NET_MODULES="sky2"
+	;;
+ppc)
+	if [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6") ]; then
+		NET_MODULES="sk98lin skge"
+	else
+		NET_MODULES="sk98lin"
+	fi
+	;;
+armv6l)
+	NET_MODULES="mii gmac";
+	;;
+esac
+SYNOLoadModules ${NET_MODULES}
+
+#DVB nodes creating
+[ -d "/dev/dvb/adapter0" ] || mkdir -p /dev/dvb/adapter0
+[ -d "/dev/dvb/adapter1" ] || mkdir -p /dev/dvb/adapter1
+[ -d "/dev/dvb/adapter2" ] || mkdir -p /dev/dvb/adapter2
+
+[ -e "/dev/dvb/adapter0/frontend0" ] || /bin/mknod /dev/dvb/adapter0/frontend0 c 212 3
+[ -e "/dev/dvb/adapter0/demux0"    ] || /bin/mknod /dev/dvb/adapter0/demux0 c 212 4
+[ -e "/dev/dvb/adapter0/dvr0"      ] || /bin/mknod /dev/dvb/adapter0/dvr0 c 212 5
+[ -e "/dev/dvb/adapter0/net0"      ] || /bin/mknod /dev/dvb/adapter0/net0 c 212 7
+
+[ -e "/dev/dvb/adapter1/frontend0" ] || /bin/mknod /dev/dvb/adapter1/frontend0 c 212 67
+[ -e "/dev/dvb/adapter1/demux0"    ] || /bin/mknod /dev/dvb/adapter1/demux0 c 212 68
+[ -e "/dev/dvb/adapter1/dvr0"      ] || /bin/mknod /dev/dvb/adapter1/dvr0 c 212 69
+[ -e "/dev/dvb/adapter1/net0"      ] || /bin/mknod /dev/dvb/adapter1/net0 c 212 71
+
+[ -e "/dev/dvb/adapter2/frontend0" ] || /bin/mknod /dev/dvb/adapter2/frontend0 c 212 131
+[ -e "/dev/dvb/adapter2/demux0"    ] || /bin/mknod /dev/dvb/adapter2/demux0 c 212 132
+[ -e "/dev/dvb/adapter2/dvr0"      ] || /bin/mknod /dev/dvb/adapter2/dvr0 c 212 133
+[ -e "/dev/dvb/adapter2/net0"      ] || /bin/mknod /dev/dvb/adapter2/net0 c 212 135
+
+if [ "no" != "$RUN_SYNOBIOS" ]; then
+	SYNOLoadModules "synobios"
+	/bin/mknod /dev/synobios c 201 0 2>/dev/null
+fi
+
+for PidDir in /var/run /etc/dhcpc;
+do
+	rm -rf ${PidDir}/*.pid
+done
+
+rm -f /usr/syno/etc/private/*.tmp.*
+
+
+## remove samba's tdb of usbprinter.tdb in each reboot to clean out of control job ##
+## see DS20 #1340
+if [ -e "/var/run/printing/usbprinter.tdb" ]; then
+	rm -rf /var/run/printing/usbprinter.tdb
+fi
+
+## remove utmp in each reboot
+if [ -e "/var/run/utmp" ]; then
+	rm -f /var/run/utmp > /dev/null 2>&1
+	touch /var/run/utmp > /dev/null 2>&1
+fi
+
+#Upgrade configuration files
+if [ -f "/var/.UpgradeBootup" ]; then
+    UpgradeConfig "before_network_start"
+fi
+
+# adjust NIC sequence
+/usr/syno/bin/synonetseqadj
+
+SYNOLoadPCIWirelessDriver
+
+if [ -x /etc/rc.network -a "${NETWORKING}" = "yes" ]; then
+	CFGEN_NETWORK="/usr/syno/bin/synochecknetworkcfg"
+	if [ -x "$CFGEN_NETWORK" ]; then
+		$CFGEN_NETWORK
+	fi
+	/etc/rc.network start
+	/etc/rc.network check-wifi-schedule
+fi
+
+case "${ThisMachine}" in
+*)
+	# Third party software support
+	if [ -d "/writeable/usr/local" ]; then
+		ln -sf /writeable/usr/local /usr/local
+	fi
+	;;
+esac
+
+if [ -r "/etc.defaults/sysctl.conf" ]; then
+	/sbin/sysctl -p /etc.defaults/sysctl.conf
+fi
+
+syslogd_enable="YES"
+syslogd_flags="-S"
+case ${syslogd_enable} in
+[Yy][Ee][Ss])
+	# Transitional symlink (for the next couple of years :) until all
+	# binaries have had a chance to move towards /var/run/log.
+	if [ ! -L /dev/log ]; then
+		# might complain for r/o root f/s
+		ln -sf /var/run/log /dev/log
+	fi
+
+	rm -f /var/run/log
+	RCMsg "Starting syslogd" \
+	${syslogd_program:-/sbin/syslogd} ${syslogd_flags}
+	/sbin/klogd
+	;;
+esac
+
+#Upgrade configuration files
+if [ -f "/var/.UpgradeBootup" ]; then
+    UpgradeConfig "before_space_assemble"
+fi
+
+#Start space
+if [ -x /usr/syno/bin/spacetool ]; then
+	/usr/syno/bin/spacetool --bootup-assemble
+	if [ "yes" != "$RUN_HA" ]; then
+		/usr/syno/bin/synovspace -all-load
+	fi
+fi
+
+for CFGEN in /usr/syno/cfgen/*;
+do
+	if [ -x "$CFGEN" ]; then
+		$CFGEN
+	fi
+done
+
+# get original value for setting below.
+GRINST_OK="/.GRINST_OK"
+WEBINST_OK="/.WEBINST_OK"
+if [ -f ${GRINST_OK} -o -f ${WEBINST_OK} ]; then
+	echo "Group/Web Installation OK, auto set configured."
+	grep -v "^configured=" /etc/synoinfo.conf > /tmp/synoinfo.conf
+	echo "configured=\"yes\"" >> /tmp/synoinfo.conf
+	mv /tmp/synoinfo.conf /etc/synoinfo.conf
+	if [ ! -f /.ds_configure_post_vol.sh ]; then
+		rm -f ${GRINST_OK}
+		rm -f ${WEBINST_OK}
+	fi
+	if [ -f /.ds_configure.sh ]; then
+		/.ds_configure.sh
+	fi
+fi
+rm -f /.ds_configure.sh > /dev/null 2>&1
+
+if [ "yes" = "$RUN_HA" ]; then
+	$SZF_HA_RC prepare-for-upg
+else
+	# initial findhostd first to report quota check progress, see DS20 bug #
+	/usr/syno/etc/rc.d/S98findhostd.sh start
+
+	# checking and Mounting filesystem(s) ...
+	/usr/syno/bin/synobootseq --set-check-fs  >/dev/null 2>&1
+	/etc.defaults/rc.volume start
+fi
+
+
+# check if shutdown normally
+if [ -f "/var/.NormalShutdown" ]; then
+	rm -f "/var/.NormalShutdown"
+elif [ -f "/.NormalShutdown" ]; then
+	rm -f "/.NormalShutdown"
+else
+	# to notice user in S99zbookok.sh
+	touch "/tmp/.ImproperShutdown"
+fi
+
+#set time zone information to kernel
+/usr/syno/bin/synokerneltz
+
+/sbin/sysctl -w kernel.core_pattern=/volume1/@%e.core
+
+if [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6") ]; then
+	/sbin/sysctl -w fs.suid_dumpable=2
+else
+	/sbin/sysctl -w kernel.suid_dumpable=2
+fi
+ulimit -c unlimited
+
+if [ "$PLATFORM" = "ti816x" ]; then
+	/sbin/sysctl -w vm.min_free_kbytes=8192
+elif [ 1048576 -le "`awk '"MemTotal:"==$1{print $2}' /proc/meminfo`" ]; then
+	# if physical memory size greater than 1GB, and then set vm.min_free_kbytes to 64MB
+	/sbin/sysctl -w vm.min_free_kbytes=65536
+elif [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6.32") ]; then
+	/sbin/sysctl -w vm.min_free_kbytes=8192
+else
+	/sbin/sysctl -w vm.min_free_kbytes=4096
+fi
+
+if [ "$CONFIGURED" = "no" -a "$SUPPORT_RAID" != "yes" ];then
+	CheckList="/volume1 /volume1/public"
+	for EachItem in $CheckList;
+	do
+		if [ ! -d "$EachItem" ]; then
+			/bin/mkdir -p $EachItem
+		fi
+		/bin/chmod 777 $EachItem
+	done
+fi
+
+if [ -f ${GRINST_OK} -o -f ${WEBINST_OK} ]; then
+	if [ -f /.ds_configure_post_vol.sh ]; then
+		/.ds_configure_post_vol.sh
+	fi
+	rm -f ${GRINST_OK}
+	rm -f ${WEBINST_OK}
+fi
+rm -f /.ds_configure_post_vol.sh > /dev/null 2>&1
+
+# FIXME: move it to Photo Station package
+#check /var/service/blog for Photo Station Blog
+if [ ! -d /var/services/blog ]; then
+	mkdir -p /var/services/blog
+	chown -R admin /var/services/blog
+	chmod -R 755 /var/services/blog
+fi
+
+# System log: "System started to boot up."
+/usr/syno/bin/synologset1 sys info 0x11100002
+
+# Network UPS: remove upsmaster before hotplug
+grep -v upsmaster /etc/synoinfo.conf > /tmp/synoinfo.tmp
+mv /tmp/synoinfo.tmp /etc/synoinfo.conf
+
+/usr/syno/etc/rc.ssl_keygen > /dev/null 2>&1 &
+
+/bin/grep eunitseq $SYNOINFO_DEF > /tmp/eunitseq
+
+#Upgrade configuration files
+if [ -f "/var/.UpgradeBootup" ]; then
+    UpgradeConfig "before_scemd_start"
+fi
+
+StartServices()
+{
+	local _srv=
+
+	/usr/syno/bin/synobootseq --set-start-services >/dev/null 2>&1
+	for _srv in $(echo /usr/syno/etc/rc.d/*.sh | sed 's/ /\n/g' | sort); do
+		$_srv start
+	done
+
+	servicetool --3rdparty start
+
+	# set boot sequence done also send service ready signal to scemd
+	/usr/syno/bin/synobootseq --set-boot-done >/dev/null 2>&1
+}
+
+RCMsg "Starting scemd"
+if ! scemd ; then
+	MsgWarn "Failed to start scemd. Reboot and get into steel plan or network install mode."
+	touch "/.noroot"
+	reboot
+fi
+
+if [ "yes" = "$SUPPORT_HA" ] && [ "yes" = "$RUN_HA" ]; then
+	$SZF_HA_RC start
+else
+	RCMsg "Starting services in background"
+	StartServices &
+fi
+
+if [ -x /etc/rc.network -a "${NETWORKING}" = "yes" ]; then
+	# Start PPPoE if enabled
+	/etc/rc.network start-pppoe
+fi
+
+if [ ! -d /initrd ]; then
+	echo "Starting findhostd in flash_rd..."
+	/usr/syno/bin/findhostd
+	# network install mode only
+	echo "Starting services in flash_rd..."
+	for service_sh in /usr/syno/etc/rc.d/J*.sh; do
+		if [ -x "$service_sh" ]; then
+			echo "Running ${service_sh}..."
+			"$service_sh" start
+		fi
+	done
+	#force to disable shortcut
+	echo 1 > /proc/sys/kernel/syno_netfilter_status
+fi
+
+# For bug 1248, probe USB device after scemd
+# usb-uhci.o is for VIA, usb-ohci.o is for NEC
+# KERNEL_MODULES="ehci-hcd.o usb-uhci.o usb-storage.o printer.o"
+if [ $KERNEL_VCODE -lt $(KernelVersionCode "2.6") ]; then
+	KERNEL_MODULES="ehci-hcd usb-ohci usb-uhci usb-storage printer hid"
+else
+	KERNEL_MODULES="ehci-hcd ohci-hcd xhci-hcd etxhci-hcd oxu210hp-hcd uhci-hcd usb-storage usblp input-core hid usbhid"
+	SUPPORT_ACM=`/bin/get_key_value /etc.defaults/synoinfo.conf support_acm`
+	if [ "$SUPPORT_ACM" == "yes" ]; then
+		KERNEL_MODULES="${KERNEL_MODULES} cdc-acm"
+		mknod /dev/ttyACM0 c 166 0
+	fi
+fi
+
+SYNOLoadModules ${KERNEL_MODULES}
+if [ "$BUILDIN_USB_MODULE" = "yes" ]; then
+	/etc/rc.scanusbdev
+	if [ "$SUPPORT_USB_VOLUME" = "yes" ]; then
+		/usr/syno/sbin/hotplugd -force
+		/usr/syno/bin/synocheckshare
+		rm /tmp/.db.*
+	fi
+fi
+
+if [ "$SUPPORT_HDD_HOTPLUG" = "yes" ]; then
+	SYNOLoadModules "syno_hddmon"
+fi
+
+if [ -r /etc/rc.local ]; then
+	echo -n 'Starting local daemons:'
+	sh /etc/rc.local
+fi
+
+if [ "$SUPPORT_STARTUPD" = "yes" ]; then
+	echo 'startup daemons'
+	if [ -d /volume1/startup ]; then
+		for startsh in /volume1/startup/S* ; do
+			if [ -f $startsh ]; then
+				echo "start $startsh"
+				$startsh
+			fi
+		done
+	fi
+fi
+
+if [ "$PLATFORM" = "ti816x" ]; then
+	SSSPKG=$(/usr/syno/bin/synopkg list | grep SurveillanceStation)
+	echo "Checking SurveillanceStation"
+	if [ ! -d /initrd ]; then
+		sleep 5
+		StartLocalInstallation
+	elif [ "$SSSPKG" == "" ] && [ -f "/.Need_Install_Surv_Station" ]; then
+		cd /.ti816x
+		./RunLocaIinstaller.sh --Continue-Install
+	fi
+fi
+
+date
+
+# start burning test if no disk installed or has built-in storage
+if should_burnin_test; then
+	/usr/sbin/burnin_test &> /dev/null &
+fi
+
+# turn on no system led of built-in storage model
+/usr/syno/bin/synohwctrl -set_stat_led nodisk
+
+/usr/syno/sbin/manutild &
+
+if [ -f /usr/syno/bin/syno_hdd_util ]; then
+	syno_hdd_util --ssd_detect --without-id-log 2>/dev/null
+fi
+
+if [ -f /.memtest -a -x /usr/sbin/syno_memtester.sh ]; then
+	if [ "$SUPPORT_DUAL_HEAD" != "yes" ]; then
+		swapoff $SwapDevice
+	fi
+	/usr/sbin/syno_memtester.sh &
+fi
+
+# create ubi_ctrl device if exist
+if [ -e /sys/devices/virtual/misc/ubi_ctrl ]; then
+	MAJOR=`cat /sys/devices/virtual/misc/ubi_ctrl/dev | cut -d':' -f 1`;
+	MINOR=`cat /sys/devices/virtual/misc/ubi_ctrl/dev | cut -d':' -f 2`;
+	mknod /dev/ubi_ctrl c $MAJOR $MINOR;
+fi
+
+SYNOTunnel
+
+exit 0

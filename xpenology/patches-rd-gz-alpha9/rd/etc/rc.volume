@@ -1,0 +1,249 @@
+#!/bin/sh
+# Copyright (c) 2000-2011 Synology Inc. All rights reserved.
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/syno/sbin:/usr/syno/bin
+
+. /etc.defaults/rc.subr
+
+# $1: path of volume
+# $2: filesystem
+VolumeQuotaCheck()
+{
+	local volume= fs= quotacheck=
+
+	[ $# -eq 2 ] || return 1
+
+	volume="$1"
+	fs="$2"
+
+	if [ ! -f "$volume/aquota.user" ] || [ ! -f "$volume/aquota.group" ]; then
+		quotacheck="yes"
+	elif [ -f "$volume/.needquotacheck" ]; then
+		MsgWarn "Got $volume/.needquotacheck"
+		rm -f "$volume/.needquotacheck" &> /dev/null
+		[ "$fs" = "ext4" ] || quotacheck="yes"
+	elif [ -f "$volume/.needquotacheck_upgrade" ]; then
+		# .needquotacheck_upgrade created by /etc/upgrade.sh
+		MsgWarn "Got $volume/.needquotacheck_upgrade"
+		rm -f "$volume/.needquotacheck_upgrade" &> /dev/null
+		[ "$fs" = "ext4" ] || quotacheck="yes"
+	fi
+
+	if [ "$quotacheck" = "yes" ]; then
+		RCMsg "Checking quota on $volume" \
+		quotacheck -g -u -F vfsv0 "$volume"
+	fi
+
+	RCMsg "Enabling quota on $volume" \
+	/sbin/quotaon -F vfsv0 "$volume"
+}
+
+# $1: path of device node
+# $2: path of volume
+# $3: filesystem (optional)
+VolumeRemount()
+{
+	local devpath= volume= fs= devname= sb=
+
+	[ $# -ge 2 ] || return 1
+
+	devpath="$1"
+	volume="$2"
+	fs="$3"
+	devname="$(echo $devpath | cut -c6-)"
+
+	if [ "$fs" = "ext4" ] || [ "$fs" = "ext3" ]; then
+		# mount ext3/4 backup superblocks
+		for sb in 1 131072 393216 655360 917504 1179648 3276800 3538944; do
+			grep -v "${devname}mount" /tmp/hdhealth > /tmp/hdhealth.tmp 2>/dev/null
+
+			RCMsg "Mounting read-only on $devpath:$volume. (superblock=$sb)" \
+			mount -o ro,sb=$sb "$devpath" "$volume"
+			if [ $? -eq 0 ]; then
+				echo "${devname}mount=\"ro\"" >> /tmp/hdhealth.tmp
+				mv -f /tmp/hdhealth.tmp /tmp/hdhealth
+				break
+			else
+				echo "${devname}mount=\"fail\"" >> /tmp/hdhealth.tmp
+				mv -f /tmp/hdhealth.tmp /tmp/hdhealth
+			fi
+		done
+	else
+		RCMsg "Mounting read-only on $devpath:$volume." \
+		mount -o ro "$devpath" "$volume"
+		if [ $? -eq 0 ]; then
+			echo "${devname}mount=\"ro\"" >> /tmp/hdhealth
+		else
+			echo "${devname}mount=\"fail\"" >> /tmp/hdhealth
+		fi
+	fi
+}
+
+# Mount device on volume
+# $1: path of device node
+# $2: path of volume
+VolumeMount()
+{
+	local devpath= volume= mntopts=
+	local fs= quotacheck= synoacl= clean=
+
+	[ $# -eq 3 ] || return 1
+
+	devpath="$1"
+	volume="$2"
+	mntopts="$3"
+
+	# determine filesystem
+	fs=$(synogetfstype $devpath)
+	if [ $? -ne 0 ]; then
+		MsgFail "Failed to read filesystem magic on $devpath:$volume. Trying ext4fs."
+		fs=ext4
+	fi
+
+	# check if cleanly umounted before mounting it
+	if [ "$fs" = "ext4" ] || [ "$fs" = "ext3" ]; then
+		if e2fsck -nq $devpath 2> /dev/null | grep -q "is cleanly umounted"; then
+			clean="yes"
+		else
+			MsgWarn "$volume is not cleanly unmounted"
+		fi
+
+		# ext3 has no journal quota and need quota check if not cleanly umounted
+		if [ "$fs" = "ext3" ] && [ "$clean" != "yes" ]; then
+			touch "$volume/.needquotacheck"
+		fi
+	fi
+
+	# mount read-only snapshot volume
+	if echo $volume | grep -q ".snap_"; then
+		RCMsg "Mounting snapshot volume" \
+		mount -o ro $devpath $volume
+		return $?
+	fi
+
+	if [ "$mntopts" != "" ]; then
+		mntopts="-o $mntopts"
+	fi
+	# mount general volume
+	RCMsg "Mounting volume $devpath:$volume" \
+	mount "$mntopts" "$devpath" "$volume"
+	if [ $? -eq 0 ]; then
+		mkdir -p "$volume/@tmp.del/"
+		delfolder=`date +%s`
+		RCMsg "move $volume/@tmp" \
+		mv "$volume/@tmp" "$volume/@tmp.del/$delfolder"
+		rm -rf "$volume/@tmp.del" &
+		mkdir "$volume/@tmp"
+		chmod 777 "$volume/@tmp"
+	else
+		VolumeRemount "$devpath" "$volume" "$fs"
+	fi
+
+	VolumeQuotaCheck "$volume" "$fs"
+}
+
+VolumePreprocess()
+{
+	#FIXME:this condition should be removed before next upgrade.
+	if [ -f "/var/.UpgradeBootup" -a -f "/.old_patch_info/VERSION" ]; then
+		oldVersion=`/bin/get_key_value /.old_patch_info/VERSION buildnumber`
+		if [ "$?" = "1" -a -n "$oldVersion" ]; then
+			if [ "$oldVersion" -ge 2508 -a "$oldVersion" -le 2637 ]; then
+				/usr/syno/bin/synofstool --fix-archive-version
+			fi
+		fi
+	fi
+
+	#Fix super block archive version issue.
+	#Do not remove it, the program will check archive version when reboot.
+	[ -e /usr/syno/bin/synoarchiveupgrade ] && \
+	/usr/syno/bin/synoarchiveupgrade &
+
+	#Recommend users to do data scrubbing if needed
+	if [ -f "/var/.UpgradeBootup" ]; then
+		/usr/syno/bin/synodatascrubbingsuggest &
+	fi
+}
+
+# mount all data volumes according to /etc/fstab
+VolumeStart()
+{
+	local v= dev= vol= opts=
+	local volumes=$(grep /volume /etc/fstab | awk '{ printf("%s:%s:%s \n", $1, $2, $4) }')
+
+	VolumeScan
+	rm -f /tmp/hdhealth
+
+	ZFSExist=`lsmod | grep zfs`
+	if [ "$ZFSExist" != "" ]; then
+		if [ ! -e "/dev/zfs" ]; then
+			ZFSnodeMajor=`cat /sys/class/misc/zfs/dev| cut -d':' -f1`
+			ZFSnodeMinor=`cat /sys/class/misc/zfs/dev| cut -d':' -f2`
+			mknod /dev/zfs c $ZFSnodeMajor $ZFSnodeMinor
+		fi
+		zpool import -a -f
+	fi
+
+	for v in $volumes; do
+		dev=$(echo $v | cut -d':' -f1)
+		vol=$(echo $v | cut -d':' -f2)
+		opts=$(echo $v | cut -d':' -f3)
+
+		mkdir -p "$vol"
+		VolumeMount "$dev" "$vol" "$opts"
+	done
+
+	VolumePreprocess
+
+	return $LSB_SUCCESS
+}
+
+VolumeStop()
+{
+	local v= dev=
+	local volumes=$(grep /volume /etc/fstab | awk '{ printf("%s:%s \n", $1, $2) }')
+
+	for v in $volumes; do
+		vol=$(echo $v | cut -d':' -f2)
+		killps "$vol"
+		quotaoff "$vol"
+		umount -f -k "$vol"
+	done
+
+	return $LSB_SUCCESS
+}
+
+VolumeStatus()
+{
+	local v= dev=
+	local ret=$LSB_STAT_RUNNING
+	local volumes=$(grep /volume /etc/fstab | awk '{ printf("%s:%s \n", $1, $2) }')
+
+	for v in $volumes; do
+		dev=$(echo $v | cut -d':' -f1)
+		if grep -q "^$dev" /proc/mounts; then
+			MsgDone "$v is enabled"
+		else
+			MsgWarn "$v is disabled"
+			ret=$LSB_STAT_NOT_RUNNING
+		fi
+	done
+
+	return $ret
+}
+
+case "$1" in
+	start)
+		VolumeStart
+		;;
+	stop)
+		VolumeStop
+		;;
+	status)
+		VolumeStatus
+		;;
+	*)
+		;;
+esac
+
+# vim:ft=sh

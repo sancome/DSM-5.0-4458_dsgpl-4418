@@ -1,0 +1,767 @@
+# Copyright (c) 2000-2012 Synology Inc. All rights reserved.
+
+
+# According to LSB 3.1 (ISO/IEC 23360:2006), the `status` init-scripts
+# action should return the following exit status codes.
+#
+LSB_STAT_RUNNING=0      # program is running or service is OK
+LSB_STAT_DEAD_FPID=1    # program is dead and /var/run pid file exists
+LSB_STAT_DEAD_FLOCK=2   # program is dead and /var/lock lock file exists
+LSB_STAT_NOT_RUNNING=3  # program is not runnning
+LSB_STAT_UNKNOWN=4      # program or service status is unknown
+LSB_STAT_BROKEN=150	# program is broken
+LSB_STAT_MODULE_ERR=151 # kernel module is dead
+# 5-99                  # reserved for future LSB use
+# 100-149               # reserved for distribution use
+# 150-199               # reserved for application use
+# 200-254               # reserved
+
+# Non-status init-scripts actions should return an exit status of zero if
+# the action was successful. Otherwise, the exit status shall be non-zero.
+#
+LSB_SUCCESS=0           # successful
+LSB_ERR_GENERIC=1       # generic or unspecified error
+LSB_ERR_ARGS=2          # invalid or excess argument(s)
+LSB_ERR_UNIMPLEMENTED=3 # unimplemented feature (for example, `reload`)
+LSB_ERR_PERM=4          # user had insufficient privilege
+LSB_ERR_INSTALLED=5     # program is not installed
+LSB_ERR_CONFIGURED=6    # program is not configured
+LSB_NOT_RUNNING=7       # program is not running
+# 8-99                  # reserved for future LSB use
+# 100-149               # reserved for distribution use
+# 150-199               # reserved for application use
+# 200-254               # reserved
+
+_MsgInit()
+{
+	local _col=80
+
+	if [ ! -t 1 ]; then
+		COLORIZED=""
+	elif [ -t 0 -a -x /bin/stty ]; then
+		# stty will fail when stdin isn't a terminal
+		_col=$(/bin/stty size | /usr/bin/cut -d' ' -f2)
+	fi
+
+	MSG_PRE="::"
+	if [ "$COLORIZED" = "yes" ]; then
+		STAT_POS="\e[$(($_col - 8))G"
+
+		C_WARN="\e[1;33m"
+		C_BUSY="\e[0;32m"
+		C_DONE="\e[1;32m"
+		C_FAIL="\e[1;31m"
+		C_MISC="\e[;1m"
+		C_CLEAR="\e[m"
+	fi
+}
+
+: ${COLORIZED:=}
+_MsgInit
+
+MsgWarn()
+{
+	[ -n "${1:-}" ] && echo -en "${C_MISC:-}${MSG_PRE:-} ${C_CLEAR:-}${1}"
+	echo -en "${STAT_POS:- ... }["
+	echo -en "${C_WARN:-}  !!  "
+	echo -e "${C_CLEAR:-}]"
+}
+
+MsgBusy()
+{
+	[ -n "${1:-}" ] && echo -en "${C_MISC:-}${MSG_PRE:-} ${C_CLEAR:-}${1}"
+	echo -en "${STAT_POS:- ... }["
+	echo -en "${C_BUSY:-} BUSY "
+	echo -en "${C_CLEAR:-}]"
+}
+
+MsgDone()
+{
+	[ -n "${1:-}" ] && echo -en "${C_MISC:-}${MSG_PRE:-} ${C_CLEAR:-}${1}"
+	echo -en "${STAT_POS:- ... }["
+	echo -en "${C_DONE:-}  OK  "
+	echo -e  "${C_CLEAR:-}]"
+}
+
+MsgFail()
+{
+	[ -n "${1:-}" ] && echo -en "${C_MISC:-}${MSG_PRE:-} ${C_CLEAR:-}${1}"
+	echo -en "${STAT_POS:- ... }["
+	echo -en "${C_FAIL:-}FAILED"
+	echo -e  "${C_CLEAR:-}]"
+}
+
+RCMsg()
+{
+	echo -n "$MSG_PRE $1"
+	shift; [ $# -eq 0 ] && { echo; return; }
+	[ "$COLORIZED" = "yes" ] && MsgBusy
+
+	$@ 1> /dev/null 2>> /var/log/messages
+	local ret=$?
+
+	[ $ret -eq 0 ] && MsgDone || MsgFail
+	return $ret
+}
+
+# Generate linux kernel version code
+# ex.
+#   KernelVersionCode "2.4.22"  => 132118
+#   KernelVersionCode "2.6"     => 132608
+#   KernelVersionCode "2.6.32"  => 132640
+#   KernelVersionCode "3"       => 196608
+#   KernelVersionCode "3.0.0"   => 196608
+KernelVersionCode()
+{
+	[ $# -eq 1 ] || return
+
+	local _version=$(echo "$1." | /usr/bin/cut -d'.' -f1)
+	local _patchlevel=$(echo "$1." | /usr/bin/cut -d'.' -f2)
+	local _sublevel=$(echo "$1." | /usr/bin/cut -d'.' -f3)
+
+	/bin/echo $((${_version:-0} * 65536 + ${_patchlevel:-0} * 256 + ${_sublevel:-0}))
+}
+
+# Get current linux kernel version without extra version
+# format: VERSION.PATCHLEVEL.SUBLEVEL
+# ex. "2.6.32"
+KernelVersion()
+{
+	local _release=$(/bin/uname -r)
+	/bin/echo ${_release%%[-+]*} | /usr/bin/cut -d'.' -f1-3
+}
+
+SYNOCheckModule()
+{
+	if [ -n "$1" ]; then
+		/bin/grep -q "^\<${1//-/_}\>" /proc/modules
+	else
+		false
+	fi
+}
+
+# Load kernel modules in sequence, and also pass arguments if specified
+# in /etc/modules.conf as the following format:
+#     module_iscsi_trgt_args_2_6_32_x86_64="high priority"
+#     module_iscsi_trgt_args_2_6_32="lower priority"
+#     module_iscsi_trgt_args="general use"
+SYNOLoadModules()
+{
+	local _mod= _modpath= _args= _env=
+	local _kv=$(KernelVersion)
+	local _mach=$(/bin/uname -m)
+	local _suffix=".ko"
+
+	[ -f /etc.defaults/modules.conf ] && source /etc.defaults/modules.conf
+	[ -f /etc/modules.local.conf ] && source /etc/modules.local.conf # for customization
+
+	for _mod in "$@"; do
+		_modpath=/lib/modules/${_mod}${_suffix}
+
+		SYNOCheckModule $_mod && continue
+
+		if [ -f ${_modpath} ]; then
+			# try to find if there's any argument for this module
+			for _env in \
+				"_${_kv//./_}_${_mach}" \
+				"_${_kv//./_}" \
+				""
+			do
+				eval _args=\$module_${_mod//-/_}_args${_env}
+				[ -n "$_args" ] && break;
+			done
+
+			RCMsg "Loading module $_mod" \
+			/sbin/insmod $_modpath $_args
+		fi
+	done
+}
+
+# Unload kernel modules in reverse sequence
+SYNOUnloadModules()
+{
+	local _mod= _list=
+
+	for _mod in "$@"; do
+		_list="$_mod $_list"
+	done
+
+	for _mod in $_list; do
+		SYNOCheckModule $_mod || continue
+		RCMsg "Unloading module $_mod" \
+		/sbin/rmmod $_mod
+	done
+}
+
+# Set error flag and exit
+# $1: ErrorStage
+# $2: ErrorNum
+# $3: ErrorFile
+IfErrorThenExit()
+{
+	local ret=${2:-1}
+
+	if [ $ret -gt 0 ]; then
+		echo "${1:-Unknown}:$ret" > ${3:-/tmp/installer.error}
+		exit $ret
+	fi
+}
+
+# Clean specified partition
+# $1: target
+# $2: disk
+CleanPartition()
+{
+	/sbin/sfdisk -N$1 -uS -q -f --no-reread -o0 -z0 -t0 -F -D $2
+}
+
+# Create partitions given partition number, size, and type
+# $1: partition number
+# $2: size in 512-byte sector
+# $3: partition type(id)
+# $4: skip size in 512-byte sector
+# $5: disk
+CreatePartition()
+{
+	/sbin/sfdisk -N$1 -uS -q -f --no-reread -j$4 -z$2 -t$3 -F $5
+}
+
+# print the size of a set
+# $1: a set of strings which split by space or newline
+# output: the set size
+UniqSize()
+{
+	echo "$1" | sed "s/\s\+/\n/g" | sort | uniq | wc -l
+}
+
+# By default (no arguments):
+#   If user set `swap_disks` option, use those disk's partition 2 as swap,
+#   otherwise, use all installed disk's partition 2 as swap.
+#   But, if no user-defined swap_disks are inserted, use all disk, too.
+#
+# $1: set this argument to use all internal disk as swap.
+# output: a set of partitions which will be assemble as swap raid.
+GenSwapParts()
+{
+	useAllDisk="$1"
+	swapIdx=`/bin/get_key_value /etc/synoinfo.conf swap_disks`
+	swapParts=""
+	SupportSAS=`/bin/get_key_value /etc.defaults/synoinfo.conf supportsas`
+	[ "$SupportSAS" = "yes" ] && postfix="p2"
+	[ "$SupportSAS" = "yes" ] || postfix="2"
+
+	[ -z "${useAllDisk}" -a -n "${swapIdx}" ] && for idx in ${swapIdx} ; do
+		partName="`/usr/syno/bin/synodiskfind 0 ${idx} --name`${postfix}"
+		if grep -q "\<${partName}\>" /proc/partitions; then
+			swapParts="${swapParts} ${partName}"
+		fi
+	done
+	if [ -n "${useAllDisk}" -o -z "${swapParts}" ]; then		# use all disks instead.
+		[ -z "${useAllDisk}" -a -n "${swapIdx}" -a -z "${swapParts}" ] && logger -s -t rc -p debug "User defined swaps not found"
+		logger -s -t rc -p debug "Use all internal disk as swap."
+		swapParts=""
+		tmpDisks=`/usr/syno/bin/synodiskport -internal`
+		if [ -z "${tmpDisks}" ] ; then
+			logger -s -t rc -p err "No internal disk installed."
+			return 1
+		else
+			for diskName in ${tmpDisks} ; do
+				partName="${diskName}${postfix}"
+				grep -q "\<${partName}\>" /proc/partitions && swapParts="${swapParts} ${partName}"
+			done
+		fi
+	fi
+
+	echo ${swapParts}
+}
+
+# We add a new feature to move swap to limited internal disks.
+# Check if need to rebuild swap raid - md1
+#
+# input   : none
+# return 0: raid is healthy and identical with user-defined swap_disks.
+# return 1: swap_raid - md1 needs rebuild
+# return 2: no disk, critical error.
+CheckSwapRaid()
+{
+	grep -qe '^md1 : active' /proc/mdstat || return 1
+
+	md1Parts=`ls /sys/block/md1/md/dev-* -d | cut -d'-' -f2 | xargs`
+	swapParts=$(GenSwapParts)
+	[ -z "${swapParts}" ] && return 2
+
+	# check md1 partitions state
+	for part in ${md1Parts} ; do
+		partState=`cat /sys/block/md1/md/dev-${part}/state`
+		if ! echo $partState | grep -q 'in_sync' ; then
+			logger -s -t rc -p warn "$part in swap is not in sync ($partState)"
+			return 1
+		fi
+
+		pos=`/usr/syno/bin/synodiskpathparse ${part} | awk -F" " '{ print $2 }'`
+		# failed to parse disk topology !! there must be something wrong
+		if [ -z "${pos}" ]; then
+			logger -s -t rc -p notice "Failed to parse partition ${part}"
+			return 2
+		fi
+	done
+
+	# check 2 sets are identical
+	swapPartsSize=$(UniqSize "${swapParts}")
+	md1PartsSize=$(UniqSize "${md1Parts}")
+	unionPartsSize=$(UniqSize "${swapParts} ${md1Parts}")
+	[ ${unionPartsSize} -ne ${swapPartsSize} -o ${unionPartsSize} -ne ${md1PartsSize} ] \
+		&& logger -s -t rc -p warn "defined swap disk is not identical" \
+		&& logger -s -t rc -p warn "    defined disks: ${swapParts}" \
+		&& logger -s -t rc -p warn "     online disks: ${md1Parts}" \
+		&& return 1
+
+	return 0
+}
+
+
+# $1: disk/partition 's path or name (eg. sda, /dev/sda, sas5p2, /dev/sas3
+# output: the disk's or the partition belongs disk 's layout index.
+FindLayoutIndex()
+{
+	SupportSAS=`/bin/get_key_value /etc.defaults/synoinfo.conf supportsas`
+	disk=$1
+	[ -z "${disk}" ] && return 1
+
+	disk=`echo ${disk} | sed 's/^\/dev\///g'`
+	grep -q "\<${disk}\>" /proc/partitions || return 1
+
+	[ "$SupportSAS" = "yes" ] && disk=`echo ${disk} | sed 's/p[0-9]\+$//g'`
+	[ "$SupportSAS" = "yes" ] || disk=`echo ${disk} | sed 's/[0-9]\+$//g'`
+	grep -q "\<${disk}\>" /proc/partitions || return 1
+
+	# synopartition --check /dev/sda
+	# /dev/sda: dont contain partition [3]
+	# /dev/sda: partition layout is version 7, list index is 10.
+	index=`/usr/syno/sbin/synopartition --check /dev/${disk} | grep 'version.*index' | awk '{print $10}' | cut -d. -f1`
+	[ -z "${index}" ] && return 1
+
+	echo ${index}
+	return 0
+}
+
+# By default (no argument), make md1 by user-defined `swap_disks`.
+#
+# $1: set this argument using all internal disk as swap.
+# return 0: normal exit.
+# return 1: mdadm create failed.
+# return 2: critical error, no disk can be assembled.
+MkSwapRaid()
+{
+	useAllDisk="$1"
+	MaxDisks=`/bin/get_key_value /etc.defaults/synoinfo.conf maxdisks`
+	swapParts=$(GenSwapParts "${useAllDisk}")
+	[ -z "${swapParts}" ] && return 2
+
+	diskCnt=0
+	md1PartsPath=""
+	sysIdx=$(FindLayoutIndex `/bin/ls -1 /sys/block/md0/slaves | head -n1`)
+	for part in $swapParts ; do
+		path="/dev/${part}"
+
+		[ -b ${path} ] || continue
+
+		umount -f ${path} &> /dev/null
+		dd if=${path} count=1 &> /dev/null || continue
+		mkfs.ext4 -n ${path} &> /dev/null || continue
+
+		partIdx=$(FindLayoutIndex ${part})
+		[ -z "${partIdx}" ] && continue
+		[ ${sysIdx} -ne ${partIdx} ] && continue
+
+		md1PartsPath="${md1PartsPath} ${path}"
+		diskCnt=$(( ${diskCnt} + 1 ))
+	done
+
+
+	if [ ${diskCnt} -gt 0 ]; then
+		[ ${diskCnt} -gt ${MaxDisks} ] \
+			&& logger -s -t rc -p err "Error: Swap candidates(${diskCnt}) is greater than max disks(${MaxDisks})" \
+			&& logger -s -t rc -p err "Error: Swap candidates: $md1PartsPath" \
+			&& return 1
+		missCnt=$(( ${MaxDisks} - ${diskCnt} ))
+		md1PartsPath="${md1PartsPath} `yes missing | head -n ${missCnt} | xargs`"
+		mdadm -C /dev/md1 -e 0.9 -amd -R -l1 -n ${MaxDisks} ${md1PartsPath}
+	else
+		if [ -z "${useAllDisk}" ]; then
+			logger -s -t rc -p err "No assigned swap disk (${swapParts}) can be assembled, use all instead."
+			MkSwapRaid "alldisk"
+			return $?
+		else
+			logger -s -t rc -p err "No disk (${swapParts}) can be assembled."
+			return 2
+		fi
+	fi
+
+	return 0
+}
+
+ExpandRaidSwap() {
+	swapoff /dev/md1
+	mdadm -S /dev/md1
+	SupportSAS=`/bin/get_key_value /etc.defaults/synoinfo.conf supportsas`
+	diskIdList=`/usr/syno/bin/synodiskport -internal`
+	for DiskIdx in ${diskIdList} ; do
+		dd if=/dev/${DiskIdx} of=/dev/null count=1 > /dev/null 2>&1
+		if [ $? = "0" ]; then
+			if [ "$SupportSAS" = "yes" ]; then
+				mkswap /dev/${DiskIdx}p2
+				swapon /dev/${DiskIdx}p2
+			else
+				mkswap /dev/${DiskIdx}2
+				swapon /dev/${DiskIdx}2
+			fi
+		fi
+	done
+}
+
+RaidSwapBack() {
+	SupportSAS=`/bin/get_key_value /etc.defaults/synoinfo.conf supportsas`
+	diskIdList=`/usr/syno/bin/synodiskport -internal`
+	if [ $? = "0" ]; then
+		for DiskIdx in ${diskIdList} ; do
+			if [ "$SupportSAS" = "yes" ]; then
+				swapoff /dev/${DiskIdx}p2
+			else
+				swapoff /dev/${DiskIdx}2
+			fi
+		done
+	fi
+	MkSwapRaid
+	swapon /dev/md1
+}
+
+VolumeScan()
+{
+	if [ -r /.vscan_confirmed ]; then
+		echo "volume scan begin"
+		mkdir -p /var/log/fsck
+		echo "Expand swap"
+		ExpandRaidSwap
+		/bin/rm -rf /.e2fs_volume > /dev/null
+		for RemapFile in `ls /.remap.*`
+		do
+			DevName="/dev/"`echo "$RemapFile" | cut -d '.' -f 3-4 | sed 's/\./\//g'`
+			ThisDevUUID=`synogetfstype -uuid ${DevName}`
+			RemapDevUUID=`synogetkeyvalue ${RemapFile} UUID`
+			if [ $ThisDevUUID == $RemapDevUUID ]; then
+				echo "$RemapFile" | cut -d '.' -f 3-4  >> /.e2fs_volume
+			else
+				/bin/rm $RemapFile
+			fi
+		done
+		RemapList=`/bin/cat /.e2fs_volume`
+		for ThisRemap in $RemapList;
+		do
+			ThisDev="/dev/"`echo $ThisRemap|sed 's/\./\//g'`
+			RemapFile="/.remap."$ThisRemap
+			echo "scan $ThisDev ..."
+			/sbin/e2fsck -C-1 -pvf $ThisDev > "/var/log/fsck/"$ThisRemap".log" 2>&1
+			if [ -f "/var/log/fsck/"$ThisRemap".log.gz" ]; then
+				/bin/rm "/var/log/fsck/"$ThisRemap".log.gz"
+			fi
+			gzip "/var/log/fsck/"$ThisRemap".log"
+			/sbin/debugfs -q $RemapFile $ThisDev
+			/bin/rm $RemapFile
+			/bin/mv $RemapFile".files" "/.badfiles."$ThisRemap
+		done
+		/bin/rm /.vscan_confirmed
+		/bin/mv /.e2fs_volume /.scemd.show.badfiles
+		RaidSwapBack
+		echo "volume scan finished"
+	fi
+}
+
+SYNOGenAllDeviceNodes()
+{
+	local devnodes=`/bin/cat /proc/partitions | grep -v "#" | cut -c 26-`
+	for devnode in ${devnodes}
+	do
+		if [ -z "${devnode}" ]; then
+			continue;
+		fi
+
+		local major=`/bin/cat /proc/partitions | grep "${devnode}$" | cut -c -4`
+		local minor=`/bin/cat /proc/partitions | grep "${devnode}$" | cut -c 5-13`
+		if [ -b /dev/${devnode} ]; then
+			rm /dev/${devnode}
+		fi
+		mknod /dev/${devnode} b $major $minor
+	done
+}
+
+# Workaround for bug#18951 - the nodes with minor > 249 may be wrong
+RegenDevNode()
+{
+	local _partnums=$(seq 1 15)
+
+	for devnode in sdja sdjb sdjc sdjd sdje sdka sdkb sdkc sdla sdlb sdlc sdma sdmb sdmc sdna sdnb sdnc sdoa sdob sdoc sdpa sdpb sdpc sdqa sdqb sdqc sdra sdrb sdrc sdsa sdsb sdsc sdta sdtb sdtc; do
+		rm /dev/${devnode}*
+	done
+
+	mknod /dev/sdja b 8 320
+	mknod /dev/sdjb b 8 336
+	mknod /dev/sdjc b 8 352
+	mknod /dev/sdjd b 8 368
+	mknod /dev/sdje b 8 384
+	mknod /dev/sdka b 65 480
+	mknod /dev/sdkb b 65 496
+	mknod /dev/sdkc b 66 256
+	mknod /dev/sdla b 67 384
+	mknod /dev/sdlb b 67 400
+	mknod /dev/sdlc b 67 416
+	mknod /dev/sdma b 69 288
+	mknod /dev/sdmb b 69 304
+	mknod /dev/sdmc b 69 320
+	mknod /dev/sdna b 70 448
+	mknod /dev/sdnb b 70 464
+	mknod /dev/sdnc b 70 480
+	mknod /dev/sdoa b 128 352
+	mknod /dev/sdob b 128 368
+	mknod /dev/sdoc b 128 384
+	mknod /dev/sdpa b 130 256
+	mknod /dev/sdpb b 130 272
+	mknod /dev/sdpc b 130 288
+	mknod /dev/sdqa b 131 416
+	mknod /dev/sdqb b 131 432
+	mknod /dev/sdqc b 131 448
+	mknod /dev/sdra b 133 320
+	mknod /dev/sdrb b 133 336
+	mknod /dev/sdrc b 133 352
+	mknod /dev/sdsa b 134 480
+	mknod /dev/sdsb b 134 496
+	mknod /dev/sdsc b 135 256
+	mknod /dev/sdta b 8 640
+	mknod /dev/sdtb b 8 656
+	mknod /dev/sdtc b 8 672
+
+	devminor=480
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdka${partnum} b 65 ${devminor}
+		mknod /dev/sdnc${partnum} b 70 ${devminor}
+		mknod /dev/sdsa${partnum} b 134 ${devminor}
+	done
+
+	devminor=496
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdkb${partnum} b 65 ${devminor}
+		mknod /dev/sdsb${partnum} b 134 ${devminor}
+	done
+
+	devminor=432
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdqb${partnum} b 131 ${devminor}
+	done
+
+	devminor=256
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdkc${partnum} b 66 ${devminor}
+		mknod /dev/sdpa${partnum} b 130 ${devminor}
+		mknod /dev/sdsc${partnum} b 135 ${devminor}
+	done
+
+	devminor=384
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdla${partnum} b 67 ${devminor}
+		mknod /dev/sdoc${partnum} b 128 ${devminor}
+		mknod /dev/sdje${partnum} b 8 ${devminor}
+	done
+
+	devminor=400
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdlb${partnum} b 67 ${devminor}
+	done
+
+	devminor=416
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdlc${partnum} b 67 ${devminor}
+		mknod /dev/sdqa${partnum} b 131 ${devminor}
+	done
+
+	devminor=288
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdma${partnum} b 69 ${devminor}
+		mknod /dev/sdpc${partnum} b 130 ${devminor}
+	done
+
+	devminor=304
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdmb${partnum} b 69 ${devminor}
+	done
+
+	devminor=320
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdmc${partnum} b 69 ${devminor}
+		mknod /dev/sdra${partnum} b 133 ${devminor}
+		mknod /dev/sdja${partnum} b 8 ${devminor}
+	done
+
+	devminor=448
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdna${partnum} b 70 ${devminor}
+		mknod /dev/sdqc${partnum} b 131 ${devminor}
+	done
+
+	devminor=464
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdnb${partnum} b 70 ${devminor}
+	done
+
+	devminor=272
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdpb${partnum} b 130 ${devminor}
+	done
+
+	devminor=336
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdrb${partnum} b 133 ${devminor}
+		mknod /dev/sdjb${partnum} b 8 ${devminor}
+	done
+
+	devminor=352
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdoa${partnum} b 128 ${devminor}
+		mknod /dev/sdrc${partnum} b 133 ${devminor}
+		mknod /dev/sdjc${partnum} b 8 ${devminor}
+	done
+
+	devminor=368
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdob${partnum} b 128 ${devminor}
+		mknod /dev/sdjd${partnum} b 8 ${devminor}
+	done
+
+	devminor=640
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdta${partnum} b 8 ${devminor}
+	done
+
+	devminor=656
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdtb${partnum} b 8 ${devminor}
+	done
+
+	devminor=672
+	for partnum in $_partnums; do
+		devminor=`expr ${devminor} + 1`
+		mknod /dev/sdtc${partnum} b 8 ${devminor}
+	done
+}
+
+loop_node_gen()
+{
+	local _i=
+
+	for _i in $(/usr/bin/seq 0 255); do
+		[ -b /dev/loop$_i ] || mknod -m 0644 /dev/loop$_i b 7 $_i
+	done
+}
+
+AddExtraKo_for_816x()
+{
+	TI816X_EXTRA_USB_MODULES="musb_hdrc nop-usb-xceiv cppi41dma ti81xx"
+	TI816X_SOUND_MODULES="soundcore regmap-i2c snd snd-hwdep snd-timer snd-page-alloc snd-pcm snd-seq-device snd-rawmidi snd-usbmidi-lib snd-usb-audio snd-soc-core snd-soc-tlv320aic3x snd-soc-ti81xx-hdmi snd-soc-syno-sii9022a-hdmi-audio snd-soc-davinci snd-soc-davinci-mcasp snd-soc-davinci-hdmi snd-soc-ti81xx-uddvr"
+	KERNEL_MODULES="${KERNEL_MODULES} ${TI816X_EXTRA_USB_MODULES} ${TI816X_SOUND_MODULES}"
+}
+
+is_pid_alive() { # <pid> [proc name]
+	local pid=${1:?"error params"}
+	local procname="$2"
+
+	if [ ! -r "/proc" -o ! -r "/proc/$pid" -o -z ${procname:-} ]; then
+		kill -0 "$pid" &>/dev/null
+	else
+		[ -n "$(readlink "/proc/$pid/exe")" ] && [ "$(basename `readlink "/proc/$pid/exe"`)" = "$procname" ]
+	fi
+}
+
+# lsb util functions
+lsb_status() { # <proc name> [pid file]
+	local procname=${1:?"error params"}
+	local pidfile=${2:-"/var/run/$procname.pid"}
+
+	if [ -f "$pidfile" ]; then
+		local pid=`cat "$pidfile"`
+		if is_pid_alive "$pid" "$procname"; then
+			return $LSB_STAT_RUNNING
+		else
+			return $LSB_STAT_DEAD_FPID
+		fi
+	fi
+
+	return $LSB_STAT_NOT_RUNNING
+}
+# vim:ft=sh
+
+StartLocalInstallation()
+{
+	local MntSb2=/synoboot2
+	local TmpSPKDest=/tmp/SSPKGDest
+	local TmpTargetDest=/tmp/SSTarget
+	local RunDest=/tmp/ti816x
+
+	mkdir $MntSb2
+	echo 1 > /proc/sys/kernel/syno_install_flag
+	mount -t vfat /dev/synoboot2 $MntSb2
+
+	local SSPKG=$(ls $MntSb2 | grep SurveillanceStation | head -n 1)
+	if [ "$SSPKG" == "" ]; then
+		umount $MntSb2
+		rm -rf $MntSb2
+		echo "Failed to find package file in flash"
+		return;
+	fi
+
+	mkdir $TmpSPKDest
+	mkdir $TmpTargetDest
+	mkdir $RunDest
+
+	echo "Untaring Builtin SurveillanceStation package"
+	tar -pxf $MntSb2/$SSPKG -C $TmpSPKDest
+	tar -zpxf $TmpSPKDest/package.tgz -C $TmpTargetDest
+	rm -rf $TmpSPKDest
+
+	mv -f $TmpTargetDest/ti816x /tmp
+	mv -f $TmpTargetDest/usr/lib /tmp/ti816x/lib
+
+	rm -rf $TmpTargetDest
+
+	cp -a $MntSb2/$SSPKG /tmp/ti816x
+
+	local PKGList="DHCPServer VPNCenter SyslogServer"
+	for PKGName in $PKGList; do
+		local PACKAGE=$(ls $MntSb2 | grep ${PKGName} | head -n 1)
+		cp -a $MntSb2/$PACKAGE /tmp/ti816x
+	done
+
+	umount $MntSb2
+	rm -rf $MntSb2
+	echo "Starting Localinstaller..."
+
+	cd $RunDest
+	./RunLocaIinstaller.sh $1
+}
+

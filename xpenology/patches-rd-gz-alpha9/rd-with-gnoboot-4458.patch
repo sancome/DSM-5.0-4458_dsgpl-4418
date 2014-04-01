@@ -1,0 +1,271 @@
+diff -ruN rd-orig/etc/rc rd/etc/rc
+--- rd-orig/etc/rc	2014-03-20 22:19:15.183588205 +0800
++++ rd/etc/rc	2014-03-22 13:27:00.901857747 +0800
+@@ -479,6 +479,7 @@
+ esac
+ 
+ if [ -r "/etc.defaults/sysctl.conf" ]; then
++	[ -e /sbin/sysctl ] && \
+ 	/sbin/sysctl -p /etc.defaults/sysctl.conf
+ fi
+ 
+@@ -542,6 +543,7 @@
+ 	$SZF_HA_RC prepare-for-upg
+ else
+ 	# initial findhostd first to report quota check progress, see DS20 bug #
++	[ -e /usr/syno/etc/rc.d/S98findhostd.sh ] && \
+ 	/usr/syno/etc/rc.d/S98findhostd.sh start
+ 
+ 	# checking and Mounting filesystem(s) ...
+@@ -561,25 +563,33 @@
+ fi
+ 
+ #set time zone information to kernel
++[ -e /usr/syno/bin/synokerneltz ] && \
+ /usr/syno/bin/synokerneltz
+ 
++[ -e /sbin/sysctl ] && \
+ /sbin/sysctl -w kernel.core_pattern=/volume1/@%e.core
+ 
+ if [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6") ]; then
++	[ -e /sbin/sysctl ] && \
+ 	/sbin/sysctl -w fs.suid_dumpable=2
+ else
++	[ -e /sbin/sysctl ] && \
+ 	/sbin/sysctl -w kernel.suid_dumpable=2
+ fi
+ ulimit -c unlimited
+ 
+ if [ "$PLATFORM" = "ti816x" ]; then
++	[ -e /sbin/sysctl ] && \
+ 	/sbin/sysctl -w vm.min_free_kbytes=8192
+ elif [ 1048576 -le "`awk '"MemTotal:"==$1{print $2}' /proc/meminfo`" ]; then
+ 	# if physical memory size greater than 1GB, and then set vm.min_free_kbytes to 64MB
++	[ -e /sbin/sysctl ] && \
+ 	/sbin/sysctl -w vm.min_free_kbytes=65536
+ elif [ $KERNEL_VCODE -ge $(KernelVersionCode "2.6.32") ]; then
++	[ -e /sbin/sysctl ] && \
+ 	/sbin/sysctl -w vm.min_free_kbytes=8192
+ else
++	[ -e /sbin/sysctl ] && \
+ 	/sbin/sysctl -w vm.min_free_kbytes=4096
+ fi
+ 
+@@ -612,6 +622,7 @@
+ fi
+ 
+ # System log: "System started to boot up."
++[ -e /usr/syno/bin/synologset1 ] && \
+ /usr/syno/bin/synologset1 sys info 0x11100002
+ 
+ # Network UPS: remove upsmaster before hotplug
+@@ -636,6 +647,7 @@
+ 		$_srv start
+ 	done
+ 
++	[ -e /usr/syno/bin/servicetool ] && \
+ 	servicetool --3rdparty start
+ 
+ 	# set boot sequence done also send service ready signal to scemd
+@@ -673,6 +685,7 @@
+ 		fi
+ 	done
+ 	#force to disable shortcut
++	[ -e /proc/sys/kernel/syno_netfilter_status ] && \
+ 	echo 1 > /proc/sys/kernel/syno_netfilter_status
+ fi
+ 
+diff -ruN rd-orig/etc/rc.network rd/etc/rc.network
+--- rd-orig/etc/rc.network	2014-03-20 22:19:15.183588205 +0800
++++ rd/etc/rc.network	2014-03-20 22:19:15.183588205 +0800
+@@ -73,7 +73,7 @@
+ {
+ 	local LEASE_FILE_NAME="dhcpd.conf.leases"
+ 	local LEASE_FILE="dhcp-leasefile=/etc/dhcpd/${LEASE_FILE_NAME}"
+-	local CONF_FILE=`ls /etc/dhcpd/dhcpd-*.conf`
++	local CONF_FILE=`ls /etc/dhcpd/dhcpd-*.conf 2> /dev/null`
+ 
+ 	if [ "${CONF_FILE}" = "" ]; then
+ 		return 1
+@@ -87,7 +87,7 @@
+ 
+ merge_dhcpd_info ()
+ {
+-	local CONF_FILE=`ls /etc/dhcpd/dhcpd-*.conf`
++	local CONF_FILE=`ls /etc/dhcpd/dhcpd-*.conf 2> /dev/null`
+ 	if [ "${CONF_FILE}" = "" ]; then
+ 		echo "enable=\"no\"" > ${DHCPD_INFO}
+ 		return 1
+@@ -112,8 +112,8 @@
+ 	# the soft link will be generated, and the link should be remove when
+ 	# DHCP Stop.
+ 	if [ -e ${DHCP_PKG_ENABLE} ]; then
+-		rm ${DHCPD_LEASES}
+-		rm ${DHCPD_LEASES_LOG}
++		rm -f ${DHCPD_LEASES}
++		rm -f ${DHCPD_LEASES_LOG}
+ 	fi
+ 	return 0
+ }
+@@ -310,6 +310,7 @@
+ 		${S01Scripts} unload_nat_mod
+ 	fi
+ 
++	[ -e /etc/dhcpd/dhcpd.info ] && \
+ 	grep "enable=\"yes\"" /etc/dhcpd/dhcpd.info
+ 	if [ ! $? -eq 0 ]; then
+ 		killall dnsmasq
+@@ -961,7 +962,7 @@
+ 			continue
+ 		fi
+ 
+-		set_mac_address ${ifn}
++		#set_mac_address ${ifn}
+ 		eval bond_opt=\$Bond_${ifn}
+ 		[ -n "${bond_opt}" ] && install_bonding_driver ${ifn} "${bond_opt}"
+ 
+diff -ruN rd-orig/etc/rc.subr rd/etc/rc.subr
+--- rd-orig/etc/rc.subr	2014-03-20 22:19:15.183588205 +0800
++++ rd/etc/rc.subr	2014-03-20 22:19:15.183588205 +0800
+@@ -56,7 +56,7 @@
+ 	fi
+ }
+ 
+-: ${COLORIZED:=}
++: ${COLORIZED:=yes}
+ _MsgInit
+ 
+ MsgWarn()
+diff -ruN rd-orig/etc/rc.volume rd/etc/rc.volume
+--- rd-orig/etc/rc.volume	2014-03-15 22:19:20.000000000 +0800
++++ rd/etc/rc.volume	2014-03-22 10:11:12.165786328 +0800
+@@ -156,6 +156,7 @@
+ 
+ 	#Fix super block archive version issue.
+ 	#Do not remove it, the program will check archive version when reboot.
++	[ -e /usr/syno/bin/synoarchiveupgrade ] && \
+ 	/usr/syno/bin/synoarchiveupgrade &
+ 
+ 	#Recommend users to do data scrubbing if needed
+diff -ruN rd-orig/linuxrc.syno rd/linuxrc.syno
+--- rd-orig/linuxrc.syno	2014-03-20 22:19:15.183588205 +0800
++++ rd/linuxrc.syno	2014-03-22 13:29:37.633857800 +0800
+@@ -1,7 +1,7 @@
+ #!/bin/sh
+ # Copyright (c) 2000-2012 Synology Inc. All rights reserved.
+ 
+-echo "START /linuxrc.syno"
++RCMsg "START /linuxrc.syno" true
+ 
+ . /etc.defaults/rc.subr
+ 
+@@ -33,6 +33,10 @@
+ USB_MODULES="usb-common usbcore ohci-hcd uhci-hcd ehci-hcd xhci-hcd"
+ USB_MODULES="${USB_MODULES} etxhci-hcd" # for Etron USB3.0
+ 
++#### ---- XPEnology ---- ####
++[ -f /.gnoboot/rc.d/pre ] && source /.gnoboot/rc.d/pre
++#### ---- XPEnology ---- ####
++
+ if [ "ppc853x" = "$UniqueRD" ]; then
+ 	insmod /lib/modules/i2c-core.ko
+ 	insmod /lib/modules/of_i2c.ko
+@@ -46,7 +50,7 @@
+ if [ -x /usr/syno/bin/synocfgen ]; then
+         insmod /lib/modules/synobios.*
+         /bin/mknod /dev/synobios c 201 0
+-        echo "Starting /usr/syno/bin/synocfgen..."
++        RCMsg "Starting /usr/syno/bin/synocfgen..."
+         /usr/syno/bin/synocfgen
+         RetCfg=$?
+         echo "/usr/syno/bin/synocfgen returns $RetCfg"
+@@ -166,9 +170,9 @@
+ 	# show date for login info
+ 	date
+ 
+-	grep "^${RootDevice}" /proc/mounts && /bin/umount -f ${Mnt}
+-	grep "sysfs" /proc/mounts && /bin/umount /sys
+-	grep "^/proc" /proc/mounts && /bin/umount /proc
++	grep -q "^${RootDevice}" /proc/mounts && /bin/umount -f ${Mnt}
++	grep -q "sysfs" /proc/mounts && /bin/umount /sys
++	grep -q "^/proc" /proc/mounts && /bin/umount /proc
+ 	exit $1
+ }
+ 
+@@ -276,7 +280,7 @@
+ 		echo "${FSCK} returns ${ResFSCK}"
+ 		case "$ResFSCK" in
+ 		4 | 8)
+-			echo "${FSCK} returns ${ResFSCK}, move into network install..."
++			RCMsg "${FSCK} returns ${ResFSCK}, move into network install..."
+ 			touch ${FsckFlag}
+ 		;;
+ 		esac
+@@ -316,7 +320,7 @@
+ 
+ 	echo "Mounting ${RootDevice} ${Mnt}"
+ 	if ! /bin/mount ${RootDevice} ${Mnt}; then
+-		echo "mount ${RootDevice} fail, returns ${ResMOUNT}"
++		RCMsg "mount ${RootDevice} fail, returns ${ResMOUNT}"
+ 		touch ${FsckFlag}
+ 	fi
+ 
+@@ -343,9 +347,10 @@
+ #
+ # check if upgrade
+ #
+-echo '------------upgrade'
++#echo '------------upgrade'
++RCMsg "Checking upgrade file" \
+ /bin/sh /etc/upgrade.sh
+-echo '============upgrade'
++#echo '============upgrade'
+ 
+ # if support SSD cache, then check if md0 is built only from SSD, if yes, boot into junior flash
+ SupportSSDCache=`/bin/get_key_value /etc.defaults/synoinfo.conf support_ssd_cache`
+@@ -368,17 +373,17 @@
+ fi
+ 
+ if [ ! -d ${Mnt}/etc ]; then
+-	echo 'Copy default /etc'
++	RCMsg 'Copy default /etc'
+ 	rm -rf ${Mnt}/etc
+ 	cp -R ${Mnt}/etc.defaults ${Mnt}/etc
+ fi
+ if [ ! -d ${Mnt}/usr/syno/etc ]; then
+-	echo 'Copy default /usr/syno/etc'
++	RCMsg 'Copy default /usr/syno/etc'
+ 	rm -rf ${Mnt}/usr/syno/etc
+ 	cp -R ${Mnt}/usr/syno/etc.defaults ${Mnt}/usr/syno/etc
+ fi
+ if [ ! -d ${Mnt}/var ]; then
+-	echo 'Copy default /var'
++	RCMsg 'Copy default /var'
+ 	rm -rf ${Mnt}/var
+ 	cp -R ${Mnt}/var.defaults ${Mnt}/var
+ fi
+@@ -399,6 +404,10 @@
+ 	Exit 4 ".memtest exists"
+ fi
+ 
++#### ---- XPEnology ---- ####
++[ -f /.gnoboot/rc.d/post ] && source /.gnoboot/rc.d/post
++#### ---- XPEnology ---- ####
++
+ UniqueFlash=`/bin/get_key_value /etc/synoinfo.conf unique`
+ UniqueHD=`/bin/get_key_value ${Mnt}/etc.defaults/synoinfo.conf unique`
+ 
+@@ -406,13 +415,6 @@
+ 	Exit 4 "Unique not match"
+ fi
+ 
+-VersionFlash=`/bin/get_key_value /etc.defaults/VERSION buildnumber`
+-VersionHD=`/bin/get_key_value ${Mnt}/etc.defaults/VERSION buildnumber`
+-
+-if [ "$VersionFlash" != "$VersionHD" ]; then
+-	Exit 7 "Version number not match"
+-fi
+-
+ if [ -f ${FsckFlag} ]; then
+ 	Exit 5 "${RootDevice} fsck fail or had lost\+found files"
+ fi

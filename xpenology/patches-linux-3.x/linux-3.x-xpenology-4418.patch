@@ -1,0 +1,152 @@
+diff -ruN linux-3.x-orig/arch/x86/mm/fault.c linux-3.x/arch/x86/mm/fault.c
+--- linux-3.x-orig/arch/x86/mm/fault.c	2014-03-19 22:59:13.000000000 +0800
++++ linux-3.x/arch/x86/mm/fault.c	2014-03-19 22:58:35.000000000 +0800
+@@ -688,6 +688,7 @@
+ show_signal_msg(struct pt_regs *regs, unsigned long error_code,
+ 		unsigned long address, struct task_struct *tsk)
+ {
++#ifndef XPENOLOGY
+ 	if (!unhandled_signal(tsk, SIGSEGV))
+ 		return;
+ 
+@@ -702,6 +703,7 @@
+ 	print_vma_addr(KERN_CONT " in ", regs->ip);
+ 
+ 	printk(KERN_CONT "\n");
++#endif /* XPENOLOGY */
+ }
+ 
+ static void
+diff -ruN linux-3.x-orig/drivers/ata/libata-core.c linux-3.x/drivers/ata/libata-core.c
+--- linux-3.x-orig/drivers/ata/libata-core.c	2014-03-14 12:48:23.000000000 +0800
++++ linux-3.x/drivers/ata/libata-core.c	2014-04-01 09:50:22.282802112 +0800
+@@ -7414,7 +7414,7 @@
+ int (*funcSYNODeepSleepEvent)(unsigned int, unsigned int) = NULL;
+ EXPORT_SYMBOL(funcSYNODeepSleepEvent);
+ 
+-#ifdef MY_DEF_HERE
++#if (defined(MY_DEF_HERE) || defined(XPENOLOGY))
+ int (*funcSYNOSendEboxRefreshEvent)(int portIndex) = NULL;
+ EXPORT_SYMBOL(funcSYNOSendEboxRefreshEvent);
+ #endif
+diff -ruN linux-3.x-orig/drivers/ata/sata_mv.c linux-3.x/drivers/ata/sata_mv.c
+--- linux-3.x-orig/drivers/ata/sata_mv.c	2014-03-14 12:48:23.000000000 +0800
++++ linux-3.x/drivers/ata/sata_mv.c	2014-03-14 13:33:31.000000000 +0800
+@@ -3706,6 +3706,7 @@
+ /*FIXME - Too brutal and directly, should separate into levels*/
+ void syno_sata_mv_gpio_write(u8 blFaulty, const unsigned short hostnum)
+ {
++#ifndef XPENOLOGY
+ 	struct Scsi_Host *shost = scsi_host_lookup(hostnum);
+ 	struct ata_port *ap = NULL;
+ 	void __iomem *host_mmio = NULL;
+@@ -3740,6 +3741,7 @@
+ 	if (NULL != shost) {
+ 		scsi_host_put(shost);
+ 	}
++#endif /* XPENOLOGY */
+ 	return;
+ }
+ EXPORT_SYMBOL(syno_sata_mv_gpio_write);
+diff -ruN linux-3.x-orig/drivers/pci/quirks.c linux-3.x/drivers/pci/quirks.c
+--- linux-3.x-orig/drivers/pci/quirks.c	2014-03-13 21:32:47.000000000 +0800
++++ linux-3.x/drivers/pci/quirks.c	2014-03-14 13:34:17.000000000 +0800
+@@ -618,7 +618,9 @@
+          ( pin < 0 || pin >= 96 ) ||
+          NULL == pValue )
+     {
++#ifndef XPENOLOGY
+         printk("parameter error. gpiobase=%08X, pin=%d, pValue=%p\n", gpiobase, pin, pValue);
++#endif /* XPENOLOGY */
+         goto END;
+     }
+     
+diff -ruN linux-3.x-orig/drivers/tty/vt/vt.c linux-3.x/drivers/tty/vt/vt.c
+--- linux-3.x-orig/drivers/tty/vt/vt.c	2014-03-13 21:32:47.000000000 +0800
++++ linux-3.x/drivers/tty/vt/vt.c	2014-03-13 21:33:19.000000000 +0800
+@@ -2474,7 +2474,7 @@
+ 		return kmsg_con;
+ }
+ 
+-#ifndef MY_ABC_HERE
++#ifdef MY_ABC_HERE
+ /*
+  *	Console on virtual terminal
+  *
+@@ -2574,7 +2574,7 @@
+ }
+ #endif
+ 
+-#ifndef MY_ABC_HERE
++#ifdef MY_ABC_HERE
+ static struct tty_driver *vt_console_device(struct console *c, int *index)
+ {
+ 	*index = c->index ? c->index-1 : fg_console;
+@@ -2942,7 +2942,7 @@
+ 
+ 	console_unlock();
+ 
+-#ifndef MY_ABC_HERE
++#ifdef MY_ABC_HERE
+ #ifdef CONFIG_VT_CONSOLE
+ 	register_console(&vt_console_driver);
+ #endif
+diff -ruN linux-3.x-orig/fs/compat_ioctl.c linux-3.x/fs/compat_ioctl.c
+--- linux-3.x-orig/fs/compat_ioctl.c	2014-03-13 21:32:47.000000000 +0800
++++ linux-3.x/fs/compat_ioctl.c	2014-03-14 13:40:52.000000000 +0800
+@@ -1760,12 +1760,14 @@
+ 	 sprintf(buf,"'%c'", (cmd>>_IOC_TYPESHIFT) & _IOC_TYPEMASK);
+ 	if (!isprint(buf[1]))
+ 		sprintf(buf, "%02x", buf[1]);
++#ifndef XPENOLOGY
+ 	compat_printk("ioctl32(%s:%d): Unknown cmd fd(%d) "
+ 			"cmd(%08x){t:%s;sz:%u} arg(%08x) on %s\n",
+ 			current->comm, current->pid,
+ 			(int)fd, (unsigned int)cmd, buf,
+ 			(cmd >> _IOC_SIZESHIFT) & _IOC_SIZEMASK,
+ 			(unsigned int)arg, fn);
++#endif /* XPENOLOGY */
+ 
+ 	if (path)
+ 		free_page((unsigned long)path);
+diff -ruN linux-3.x-orig/include/linux/syno.h linux-3.x/include/linux/syno.h
+--- linux-3.x-orig/include/linux/syno.h	2014-03-14 09:40:41.000000000 +0800
++++ linux-3.x/include/linux/syno.h	2014-03-14 09:41:39.000000000 +0800
+@@ -27,8 +27,8 @@
+ #define SYNO_USB_FLASH_DEVICE_NAME  "synoboot"
+ #define SYNO_USB_FLASH_DEVICE_PATH  "/dev/synoboot"
+ #if 1
+-#define IS_SYNO_USBBOOT_ID_VENDOR(VENDOR) (0xF400 == (VENDOR) || 0xF401 == (VENDOR))
+-#define IS_SYNO_USBBOOT_ID_PRODUCT(PRODUCT) (0xF400 == (PRODUCT) || 0xF401 == (PRODUCT))
++#define IS_SYNO_USBBOOT_ID_VENDOR(VENDOR) (0xF400 == (VENDOR) || 0x090C == (VENDOR) || 0x0781 == (VENDOR) || 0x0EA0 == (VENDOR))
++#define IS_SYNO_USBBOOT_ID_PRODUCT(PRODUCT) (0xF401 == (PRODUCT) || 0x1000 == (PRODUCT) || 0x5571 == (PRODUCT) || 0x2168 == (PRODUCT))
+ #else
+ #define IS_SYNO_USBBOOT_ID_VENDOR(VENDOR) (0xF400 == (VENDOR))
+ #define IS_SYNO_USBBOOT_ID_PRODUCT(PRODUCT) (0xF400 == (PRODUCT))
+diff -ruN linux-3.x-orig/include/linux/syno_user.h linux-3.x/include/linux/syno_user.h
+--- linux-3.x-orig/include/linux/syno_user.h	2014-03-13 21:32:47.000000000 +0800
++++ linux-3.x/include/linux/syno_user.h	2014-03-13 21:33:19.000000000 +0800
+@@ -4,6 +4,11 @@
+ #define __SYNO_USER_H_
+ 
+ /**
++ * XPEnology project
++ */
++#define XPENOLOGY
++
++/**
+  * Dsc: Synology multimedia server feature. For indexing video, photo,
+  *      music.
+  * Ref: libsynosdk, lnxnetatalk, lnxsdk, rsync, samba, smbftpd
+diff -ruN linux-3.x-orig/kernel/sysctl.c linux-3.x/kernel/sysctl.c
+--- linux-3.x-orig/kernel/sysctl.c	2014-03-13 21:32:47.000000000 +0800
++++ linux-3.x/kernel/sysctl.c	2014-03-13 21:33:19.000000000 +0800
+@@ -228,7 +228,7 @@
+ int (*funcSYNOGetHwCapability)(CAPABILITY *) = NULL;
+ EXPORT_SYMBOL(funcSYNOGetHwCapability);
+ 
+-#ifdef MY_DEF_HERE
++#if (defined(MY_DEF_HERE) || defined(XPENOLOGY))
+ EUNIT_PWRON_TYPE (*funcSynoEunitPowerctlType)(void) = NULL;
+ EXPORT_SYMBOL(funcSynoEunitPowerctlType);
+ #endif

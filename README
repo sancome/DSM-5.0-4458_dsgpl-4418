@@ -1,0 +1,15 @@
+Please follow the following steps to build the img file:
+
+Step A:
+./01-unzip-linux-3.x.sh
+
+Step B:
+cd ./workspace/linux-3.x
+make ARCH=x86_64 CROSS_COMPILE=../x86_64-pc-linux-gnu/bin/x86_64-pc-linux-gnu- menuconfig
+make ARCH=x86_64 CROSS_COMPILE=../x86_64-pc-linux-gnu/bin/x86_64-pc-linux-gnu- modules
+make ARCH=x86_64 CROSS_COMPILE=../x86_64-pc-linux-gnu/bin/x86_64-pc-linux-gnu- bzImage
+
+Step C:
+./02-build-img-file.sh
+
+Finally, you can burn the img file to the USB disk.

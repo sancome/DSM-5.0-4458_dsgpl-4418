@@ -1,0 +1,77 @@
+#!/bin/sh
+gnoBoot=/.gnoboot
+gnoRoot=/tmpRoot
+gnoLogFile=/var/log/messages
+
+gnoBootRegen()
+{
+        procpart=/proc/partitions
+	[ $(grep -cv \# ${procpart}) -le 1 ] && return
+        disksec=32098
+        diskpre=$(grep "${disksec}" ${procpart}|cut -c 26-)
+	[ "${diskpre}x" == "x" ] && return
+        diskpre=${diskpre//[1-9]*}
+        disklist=$(grep "${diskpre}" ${procpart}|cut -c 26-)
+        for dsk in $disklist; do
+		dsknum=""
+		synoboot=/dev/synoboot
+                dskline=$(grep "${dsk}$" ${procpart})
+                dskmaj=$(grep "${dsk}$" ${procpart} | cut -c -4)
+                dskmin=$(grep "${dsk}$" ${procpart} | cut -c 5-13)
+                dskdev=/dev/${dsk}
+                dsknum=${dsk//*${diskpre}}
+                [ -e ${dskdev} ] && rm -f ${dskdev}
+                echo "Creating ${synoboot}..." >> ${gnoLogFile}
+                if [ -z "${dsknum}" ]; then
+                        rm -f ${synoboot}
+                        mknod ${synoboot} b ${dskmaj} ${dskmin}
+                else
+                        synoboot=${synoboot}${dsknum}
+                        rm -f ${synoboot}
+                        mknod ${synoboot} b ${dskmaj} ${dskmin}
+                fi
+        done
+        [ ${dsknum} -eq 1 ] && ln -sf ${synoboot} /dev/synoboot2
+}
+
+gnoBootIsCmdParam()
+{
+	param=${1:='xgnoBootx'}
+	found=$(grep -c "${param}" /proc/cmdline)	
+	if [ ${found} -eq 1 ]; then
+		echo 1
+	else
+		echo 0	
+	fi
+}
+
+gnoCheckSum()
+{
+	myFile="$1"
+	if [ -f ${myFile} ]; then 
+		mySum=$(/usr/bin/cksum ${myFile} | /usr/bin/cut -d " " -f1)
+		echo ${mySum}
+	else
+		echo "xxxxxxxxxx"
+	fi
+}
+
+gnoUpdateFile()
+{
+	mySrc="$1"
+	myDst="$2"
+	mySrcSum=$(gnoCheckSum ${mySrc})
+	myDstSum=$(gnoCheckSum ${myDst})
+	
+	if [ ${mySrcSum} != ${myDstSum} ]; then
+		RCMsg "Updating $(basename $2)" \
+		cp -af ${mySrc} ${myDst}
+	fi
+}
+
+gnoMountRoot()
+{
+	# Fixme: check if raid disk is enabled
+	[ `grep -c md0 /proc/mounts` -lt 1 ] && \
+		mount -o nosynoacl /dev/md0 ${gnoRoot}
+}

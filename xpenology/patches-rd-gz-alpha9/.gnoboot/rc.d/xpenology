@@ -1,0 +1,23 @@
+#!/bin/sh
+source /etc/rc.subr
+source /.gnoboot/rc.init
+
+[ -d "${gnoBoot}" ] || exit 1
+
+gnoBootMountPCI()
+{
+	if [ -f ${gnoBoot}/devices-append ]; then
+		if [ `grep -c pci/devices /proc/mounts` -eq 0 ]; then
+			/bin/cp -f ${gnoBoot}/devices-append /tmp/.devices
+			cat /proc/bus/pci/devices >> /tmp/.devices
+			/bin/mount -n -o bind,ro /tmp/.devices /proc/bus/pci/devices
+		fi 
+		echo "Re-generating missing device nodes..." >> ${gnoLogFile}
+		SYNOGenAllDeviceNodes
+	fi
+}
+
+gnoBootMountPCI
+gnoBootRegen
+
+exit 0
